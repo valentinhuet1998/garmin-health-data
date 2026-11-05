@@ -16,16 +16,22 @@ purpose-built for the openetl pipeline. Provides:
 
 Public surface:
 
-- :class:`GarminClient`: the only public class.
+- :class:`GarminClient`: SSO (email/password) client.
+- :class:`PersonalApiClient`: Personal API (API-key) client, serving a subset of
+  the endpoints.
+- :class:`HybridClient`: routes each call to the Personal API when it serves it,
+  falling back to the SSO client.
 - :class:`ActivityDownloadFormat`: enum of supported binary download formats.
 - :class:`GarminAuthenticationError`,
   :class:`GarminConnectionError`,
-  :class:`GarminTooManyRequestsError`: exceptions matching the upstream
+  :class:`GarminTooManyRequestsError`,
+  :class:`GarminUnsupportedEndpointError`: exceptions matching the upstream
   library's error semantics with shorter names.
 
 The internal modules (:mod:`.client`, :mod:`.strategies`, :mod:`.api`,
-:mod:`.tokens`, :mod:`.constants`, :mod:`.exceptions`) are implementation
-detail; consumers should only import from this package's top level.
+:mod:`.tokens`, :mod:`.constants`, :mod:`.exceptions`, :mod:`.personal`,
+:mod:`.hybrid`) are implementation detail; consumers should only import from this
+package's top level.
 """
 
 from .api import ActivityDownloadFormat
@@ -34,7 +40,10 @@ from .exceptions import (
     GarminAuthenticationError,
     GarminConnectionError,
     GarminTooManyRequestsError,
+    GarminUnsupportedEndpointError,
 )
+from .hybrid import HybridClient
+from .personal import PersonalApiClient
 
 __all__ = [
     "ActivityDownloadFormat",
@@ -42,4 +51,7 @@ __all__ = [
     "GarminClient",
     "GarminConnectionError",
     "GarminTooManyRequestsError",
+    "GarminUnsupportedEndpointError",
+    "HybridClient",
+    "PersonalApiClient",
 ]

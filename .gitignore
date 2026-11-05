@@ -67,3 +67,6 @@ dmypy.json
 # Distribution
 dist/
 build/
+
+# Local secrets (Garmin Personal API key).
+.env

@@ -314,9 +314,11 @@ class TestExtractFunctionExerciseSets:
         mock_extractor.extract_fit_activities.assert_called_once()
         mock_extractor.extract_garmin_data.assert_called_once()
 
-        # Verify authenticate is called with the discovered token dir.
+        # Verify authenticate is called with the discovered token dir (no API key in
+        # the environment, so no pre-authenticated Personal API client).
         mock_extractor.authenticate.assert_called_once_with(
-            token_store_dir=str(Path("/fake/token/dir"))
+            token_store_dir=str(Path("/fake/token/dir")),
+            personal_client=None,
         )
 
 
@@ -1665,11 +1667,19 @@ def test_garmin_client_exposes_a_delegator_for_every_registered_api_method():
     """
     from garmin_health_data.constants import GARMIN_DATA_REGISTRY
     from garmin_health_data.garmin_client.client import GarminClient
+    from garmin_health_data.garmin_client.personal import PersonalApiClient
 
+    # Personal-API-only data types (daily summary, HRV status, ...) have no SSO
+    # equivalent: their method lives on PersonalApiClient instead. The hybrid client
+    # routes to whichever client defines it.
     missing = []
     not_callable = []
     for data_type in GARMIN_DATA_REGISTRY.all_data_types:
         method = getattr(GarminClient, data_type.api_method, None)
+        if method is None and data_type.api_method in (
+            PersonalApiClient.SUPPORTED_METHODS
+        ):
+            method = getattr(PersonalApiClient, data_type.api_method, None)
         if method is None:
             missing.append((data_type.name, data_type.api_method))
             continue
@@ -1677,16 +1687,24 @@ def test_garmin_client_exposes_a_delegator_for_every_registered_api_method():
             not_callable.append((data_type.name, data_type.api_method))
 
     assert not missing, (
-        f"GarminClient is missing delegator methods for registered data "
-        f"types: {missing}. Each registered api_method must be exposed as a "
-        f"method on GarminClient (matching the existing pattern in "
-        f"garmin_client/client.py) so the extractor's "
+        f"No client exposes delegator methods for registered data types: "
+        f"{missing}. Each registered api_method must be a method on GarminClient "
+        f"(garmin_client/client.py), or on PersonalApiClient and listed in its "
+        f"SUPPORTED_METHODS, so the extractor's "
         f"getattr(self.garmin_client, data_type.api_method) succeeds."
     )
     assert not not_callable, (
-        f"GarminClient has non-callable attributes for registered data "
+        f"Clients have non-callable attributes for registered data "
         f"types: {not_callable}."
     )
+
+    # Every method PersonalApiClient claims to serve must exist on it.
+    undefined = [
+        name
+        for name in PersonalApiClient.SUPPORTED_METHODS
+        if not callable(getattr(PersonalApiClient, name, None))
+    ]
+    assert not undefined, f"SUPPORTED_METHODS lists undefined methods: {undefined}."
 
 
 # ---------------------------------------------------------------------------

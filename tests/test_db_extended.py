@@ -9,6 +9,7 @@ This test suite provides comprehensive coverage of:
     - Error handling for database operations.
 """
 
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -23,11 +24,12 @@ from garmin_health_data.db import (
     get_database_size,
     get_engine,
     get_last_update_dates,
+    get_latest_date,
     get_record_counts,
     get_session,
     initialize_database,
 )
-from garmin_health_data.models import User
+from garmin_health_data.models import DailySummary, HrvSummary, User
 
 
 class TestGetEngine:
@@ -173,6 +175,37 @@ class TestGetLastUpdateDates:
         assert dates["sleep"] is None
         assert dates["heart_rate"] is None
         assert dates["activity"] is None
+
+    def test_last_update_dates_filtered_per_account(
+        self,
+        db_engine: Engine,
+        db_session: Session,
+    ) -> None:
+        """
+        ``user_ids`` restricts the lookup, so an up-to-date account does not hide
+        another account's older data.
+
+        :param db_engine: Database engine fixture.
+        :param db_session: Database session fixture.
+        """
+        db_session.add_all([User(user_id=1), User(user_id=2)])
+        db_session.flush()
+        db_session.add_all(
+            [
+                DailySummary(user_id=1, date=date(2026, 11, 3)),
+                DailySummary(user_id=2, date=date(2026, 10, 1)),
+                HrvSummary(user_id=2, date=date(2026, 10, 5)),
+            ]
+        )
+        db_session.commit()
+        temp_db_path = db_engine.url.database
+
+        assert get_latest_date(temp_db_path) == date(2026, 11, 3)
+        assert get_latest_date(temp_db_path, [1]) == date(2026, 11, 3)
+        assert get_latest_date(temp_db_path, ["2"]) == date(2026, 10, 5)
+        assert get_latest_date(temp_db_path, [3]) is None
+        dates = get_last_update_dates(temp_db_path, [2])
+        assert dates["daily_summary"] == date(2026, 10, 1)
 
     def test_get_last_update_dates_with_data(
         self,

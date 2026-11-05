@@ -1323,3 +1323,208 @@ class MenstrualCycleSummary(Base, UpsertBase):
     start_date = Column(Date, primary_key=True)
     period_length = Column(Integer)
     predicted_cycle = Column(Boolean, nullable=False)
+
+
+# ----------------------------------------------------------------------------------------
+# PERSONAL API DATA
+# ----------------------------------------------------------------------------------------
+
+
+class DailySummary(Base, UpsertBase):
+    """
+    Daily wellness summary from the Personal API usersummary endpoint.
+
+    One row per user and calendar day: steps, distance, floors, calories, activity
+    time, intensity minutes, heart rate, stress breakdown, body battery, SpO2 and
+    respiration aggregates. Durations are in seconds.
+    """
+
+    __tablename__ = "daily_summary"
+
+    user_id = Column(BigInteger, ForeignKey("user.user_id"), primary_key=True)
+    date = Column(Date, primary_key=True)
+    total_steps = Column(Integer)
+    daily_step_goal = Column(Integer)
+    total_distance_meters = Column(Integer)
+    floors_ascended = Column(Float)
+    floors_descended = Column(Float)
+    user_floors_ascended_goal = Column(Integer)
+    total_kilocalories = Column(Float)
+    active_kilocalories = Column(Float)
+    bmr_kilocalories = Column(Float)
+    consumed_kilocalories = Column(Float)
+    active_seconds = Column(Integer)
+    highly_active_seconds = Column(Integer)
+    sedentary_seconds = Column(Integer)
+    sleeping_seconds = Column(Integer)
+    measurable_asleep_duration = Column(Integer)
+    measurable_awake_duration = Column(Integer)
+    moderate_intensity_minutes = Column(Integer)
+    vigorous_intensity_minutes = Column(Integer)
+    intensity_minutes_goal = Column(Integer)
+    resting_heart_rate = Column(Integer)
+    min_heart_rate = Column(Integer)
+    max_heart_rate = Column(Integer)
+    last_seven_days_avg_resting_heart_rate = Column(Integer)
+    average_stress_level = Column(Integer)
+    max_stress_level = Column(Integer)
+    stress_qualifier = Column(Text)
+    rest_stress_duration = Column(Integer)
+    low_stress_duration = Column(Integer)
+    medium_stress_duration = Column(Integer)
+    high_stress_duration = Column(Integer)
+    activity_stress_duration = Column(Integer)
+    uncategorized_stress_duration = Column(Integer)
+    total_stress_duration = Column(Integer)
+    body_battery_at_wake_time = Column(Integer)
+    body_battery_highest_value = Column(Integer)
+    body_battery_lowest_value = Column(Integer)
+    body_battery_most_recent_value = Column(Integer)
+    body_battery_charged_value = Column(Integer)
+    body_battery_drained_value = Column(Integer)
+    body_battery_during_sleep = Column(Integer)
+    body_battery_feedback_short = Column(Text)
+    body_battery_feedback_long = Column(Text)
+    body_battery_end_of_day_feedback_short = Column(Text)
+    body_battery_end_of_day_feedback_long = Column(Text)
+    average_spo2 = Column(Float)
+    lowest_spo2 = Column(Integer)
+    latest_spo2 = Column(Integer)
+    avg_waking_respiration_value = Column(Float)
+    highest_respiration_value = Column(Float)
+    lowest_respiration_value = Column(Float)
+    includes_wellness_data = Column(Boolean)
+    includes_activity_data = Column(Boolean)
+    source = Column(Text)
+
+
+class HrvSummary(Base, UpsertBase):
+    """
+    Nightly HRV status: last-night and weekly averages, baseline range, and status.
+
+    One row per user and calendar day. The individual overnight readings are stored in
+    :class:`HRV`, linked to the matching sleep session.
+    """
+
+    __tablename__ = "hrv_summary"
+
+    user_id = Column(BigInteger, ForeignKey("user.user_id"), primary_key=True)
+    date = Column(Date, primary_key=True)
+    last_night_avg = Column(Integer)
+    last_night_5min_high = Column(Integer)
+    weekly_avg = Column(Integer)
+    status = Column(Text)
+    feedback_phrase = Column(Text)
+    baseline_low_upper = Column(Integer)
+    baseline_balanced_low = Column(Integer)
+    baseline_balanced_upper = Column(Integer)
+    baseline_marker_value = Column(Float)
+    sleep_start_ts = Column(DateTime(timezone=True))
+    sleep_end_ts = Column(DateTime(timezone=True))
+
+
+class BodyBatteryEvent(Base, UpsertBase):
+    """
+    Body battery impact events (sleep, activities, naps, stress) with their charge or
+    drain.
+    """
+
+    __tablename__ = "body_battery_event"
+
+    user_id = Column(BigInteger, ForeignKey("user.user_id"), primary_key=True)
+    start_ts = Column(DateTime(timezone=True), primary_key=True)
+    event_type = Column(Text, primary_key=True)
+    duration_ms = Column(BigInteger)
+    impact = Column(Integer)
+    feedback_type = Column(Text)
+    short_feedback = Column(Text)
+    timezone_offset_ms = Column(BigInteger)
+
+
+class FitnessAge(Base, UpsertBase):
+    """
+    Garmin fitness age estimates, sampled weekly.
+    """
+
+    __tablename__ = "fitness_age"
+
+    user_id = Column(BigInteger, ForeignKey("user.user_id"), primary_key=True)
+    date = Column(Date, primary_key=True)
+    fitness_age = Column(Float)
+    chronological_age = Column(Integer)
+    previous_fitness_age = Column(Float)
+    bmi = Column(Float)
+    resting_heart_rate = Column(Integer)
+    vigorous_days_avg = Column(Float)
+    vigorous_minutes_avg = Column(Float)
+    last_updated = Column(DateTime)
+
+
+class HeartRateZone(Base, UpsertBase):
+    """
+    Current heart rate zone configuration per sport.
+    """
+
+    __tablename__ = "heart_rate_zone"
+
+    user_id = Column(BigInteger, ForeignKey("user.user_id"), primary_key=True)
+    sport = Column(Text, primary_key=True)
+    training_method = Column(Text)
+    lactate_threshold_heart_rate = Column(Integer)
+    max_heart_rate = Column(Integer)
+    resting_heart_rate = Column(Integer)
+    resting_hr_auto_update = Column(Boolean)
+    zone1_floor = Column(Integer)
+    zone2_floor = Column(Integer)
+    zone3_floor = Column(Integer)
+    zone4_floor = Column(Integer)
+    zone5_floor = Column(Integer)
+
+
+class ActivityWorkout(Base, UpsertBase):
+    """
+    Structured workouts followed during an activity (planned steps and targets).
+    """
+
+    __tablename__ = "activity_workout"
+
+    activity_id = Column(
+        BigInteger,
+        ForeignKey("activity.activity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    workout_index = Column(Integer, primary_key=True)
+    workout_name = Column(Text)
+    sport = Column(Text)
+    manufacturer = Column(Text)
+    step_count = Column(Integer, nullable=False)
+    steps_json = Column(JSON, nullable=False)
+    time_created = Column(Text)
+
+    __table_args__ = (
+        CheckConstraint(
+            "json_valid(steps_json)", name="activity_workout_steps_json_valid"
+        ),
+        CheckConstraint(
+            "json_type(steps_json) = 'array'",
+            name="activity_workout_steps_json_is_array",
+        ),
+    )
+
+
+class NutritionLog(Base, UpsertBase):
+    """
+    Logged food and meals per day, stored as returned by Garmin.
+    """
+
+    __tablename__ = "nutrition_log"
+
+    user_id = Column(BigInteger, ForeignKey("user.user_id"), primary_key=True)
+    date = Column(Date, primary_key=True)
+    food_count = Column(Integer, nullable=False)
+    meal_count = Column(Integer, nullable=False)
+    log_json = Column(JSON, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("json_valid(log_json)", name="nutrition_log_log_json_valid"),
+    )

@@ -13,8 +13,27 @@ import pytest
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from garmin_health_data import auth as auth_module
 from garmin_health_data.db import create_tables, get_engine
 from garmin_health_data.models import Base
+
+
+@pytest.fixture(autouse=True)
+def _isolate_personal_api_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    Keep a developer's real Personal API key out of every test.
+
+    Unsets ``GARMIN_PERSONAL_API_KEY`` and points the ``.env`` lookup at a file that
+    does not exist, so no test reads a real key from the environment or from the
+    repository's ``.env`` and calls Garmin.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temporary directory fixture.
+    """
+    monkeypatch.delenv(auth_module.API_KEY_ENV_VAR, raising=False)
+    monkeypatch.setattr(
+        auth_module, "DEFAULT_DOTENV_PATH", tmp_path / "no-such-dir" / ".env"
+    )
 
 
 @pytest.fixture

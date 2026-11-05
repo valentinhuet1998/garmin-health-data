@@ -15,6 +15,7 @@ from sqlalchemy import text
 
 from garmin_health_data.__version__ import __version__
 from garmin_health_data.auth import (
+    api_key_auth,
     bootstrap_from_ticket,
     ensure_authenticated,
     get_credentials,
@@ -33,6 +34,7 @@ from garmin_health_data.db import (
     initialize_database,
 )
 from garmin_health_data.extractor import extract as extract_data
+from garmin_health_data.extractor import find_earliest_activity_date
 from garmin_health_data.lifecycle import (
     LockHeldError,
     acquire_lock,
@@ -112,20 +114,38 @@ def _is_interactive() -> bool:
 
 @cli.command()
 @click.option(
+    "--api-key",
+    default=None,
+    help=(
+        "Garmin Personal API key (default method). Read from the "
+        "GARMIN_PERSONAL_API_KEY env var or ./.env if omitted, else prompted. "
+        "Passing it here exposes it to shell history."
+    ),
+)
+@click.option(
+    "--sso",
+    is_flag=True,
+    help=(
+        "Log in with email/password instead of an API key. Needed for the data "
+        "types the Personal API does not serve (training status/readiness, "
+        "records, race predictions, respiration, floors, ...)."
+    ),
+)
+@click.option(
     "--email",
     envvar="GARMIN_EMAIL",
-    help="Garmin Connect email (or set GARMIN_EMAIL env var)",
+    help="Garmin Connect email for --sso (or set GARMIN_EMAIL env var)",
 )
 @click.option(
     "--password",
     envvar="GARMIN_PASSWORD",
-    help="Garmin Connect password (or set GARMIN_PASSWORD env var)",
+    help="Garmin Connect password for --sso (or set GARMIN_PASSWORD env var)",
 )
 @click.option(
     "--manual",
     is_flag=True,
     help=(
-        "Log in with a browser-captured ticket instead of email/password. Use "
+        "SSO login with a browser-captured ticket instead of email/password. Use "
         "when Cloudflare blocks the automated login."
     ),
 )
@@ -138,17 +158,22 @@ def _is_interactive() -> bool:
     ),
 )
 def auth(
+    api_key: Optional[str],
+    sso: bool,
     email: Optional[str],
     password: Optional[str],
     manual: bool,
     ticket: Optional[str],
 ):
     """
-    Authenticate with Garmin Connect and save tokens.
+    Authenticate with Garmin Connect and save credentials.
 
-    By default this logs in with your email and password. If Garmin's Cloudflare
-    protection blocks that (repeated 403/429 errors), use --manual to log in with a
-    ticket captured from your own browser session.
+    By default this validates and saves a Garmin Personal API key (create one at
+    https://connect.garmin.com/app/settings/personalApiToken). Use --sso to log in
+    with your email and password instead, for the data types the Personal API does
+    not serve; both can be set up for the same account. If Garmin's Cloudflare
+    protection blocks the email/password login (repeated 403/429 errors), use
+    --manual to log in with a ticket captured from your own browser session.
     """
     # Manual browser-ticket bootstrap (Cloudflare-blocked login workaround).
     if ticket is not None:
@@ -156,6 +181,11 @@ def auth(
         return
     if manual:
         manual_auth()
+        return
+
+    # Personal API key (default), unless an SSO login was requested.
+    if not (sso or (email and password)):
+        api_key_auth(api_key)
         return
 
     if email and password:
@@ -807,6 +837,139 @@ def extract(
     except LockHeldError as e:
         click.secho(f"❌ {e}", fg="red")
         raise click.Abort()
+
+
+@cli.command()
+@click.option(
+    "--full",
+    is_flag=True,
+    help="Sync the whole history, from the oldest recorded activity (looked up "
+    "with the Personal API key) or from --start-date if given.",
+)
+@click.option(
+    "--start-date",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    help="Start date (YYYY-MM-DD, inclusive). Overrides the automatic start.",
+)
+@click.option(
+    "--overlap-days",
+    type=click.IntRange(0, 30),
+    default=2,
+    show_default=True,
+    help="On incremental syncs, re-fetch this many days before the last stored date "
+    "so partially-synced days (e.g. yesterday evening) are completed.",
+)
+@click.option(
+    "--exclude-data-types",
+    multiple=True,
+    help="Data types to leave out (can specify multiple times).",
+)
+@click.option(
+    "--db-path",
+    type=click.Path(),
+    default="garmin_data.db",
+    help="Path to SQLite database file.",
+)
+@click.option(
+    "--accounts",
+    multiple=True,
+    help="Garmin user IDs to sync (comma-separated or repeated). Syncs all "
+    "discovered accounts if not specified.",
+)
+@click.pass_context
+def sync(
+    ctx: click.Context,
+    full: bool,
+    start_date: Optional[datetime],
+    overlap_days: int,
+    exclude_data_types: tuple,
+    db_path: str,
+    accounts: tuple,
+):
+    """
+    Synchronize every data type available to your credentials, through today.
+
+    With a Personal API key this covers activities and FIT files, structured
+    workouts, heart rate, sleep, HRV, daily summaries (steps, stress, body battery,
+    SpO2, respiration, intensity minutes), the body battery time series and events,
+    fitness age, heart rate zones, body composition, nutrition and menstrual cycle
+    days. Data types that need email/password tokens are included when those exist.
+
+    Unlike 'garmin extract', the window ends today (inclusive), so this morning's
+    sleep, HRV and body battery are included, and incremental runs re-fetch the last
+    --overlap-days days so a day synced while it was still in progress gets
+    completed. Use --full once for the whole history, then run 'garmin sync'
+    regularly (e.g. daily).
+    """
+    accounts_list = (
+        [a.strip() for raw in accounts for a in raw.split(",") if a.strip()]
+        if accounts
+        else None
+    )
+    today = datetime.now().date()
+
+    if start_date is not None:
+        start = start_date.date()
+        click.secho(f"📅 Start date: {format_date(start)} (--start-date)", fg="cyan")
+    elif full:
+        ensure_authenticated()
+        earliest = find_earliest_activity_date(accounts_list)
+        if earliest is None:
+            click.secho(
+                "❌ Could not determine the start of your history (no Personal API "
+                "key, or no recorded activity). Pass --start-date YYYY-MM-DD.",
+                fg="red",
+            )
+            raise click.Abort()
+        start = earliest
+        click.secho(
+            f"📅 Full sync from the oldest activity: {format_date(start)}", fg="cyan"
+        )
+    else:
+        if not database_exists(db_path):
+            latest = None
+        elif accounts_list:
+            # Per account: start from the account that is furthest behind, so one
+            # up-to-date account does not hide another account's missing days. An
+            # account without any stored data makes the window fall back to 30 days.
+            per_account = [get_latest_date(db_path, [a]) for a in accounts_list]
+            latest = None if None in per_account else min(per_account)
+        else:
+            latest = get_latest_date(db_path)
+        if latest:
+            start = min(latest, today) - timedelta(days=overlap_days)
+            click.secho(
+                f"📅 Incremental sync from {format_date(start)} (last stored date "
+                f"{format_date(latest)} minus {overlap_days} day(s) of overlap)",
+                fg="cyan",
+            )
+        else:
+            start = today - timedelta(days=30)
+            click.secho(
+                f"📅 Empty database: syncing the last 30 days from "
+                f"{format_date(start)}. Run 'garmin sync --full' for the whole "
+                f"history.",
+                fg="cyan",
+            )
+
+    if start > today:
+        start = today
+
+    # extract() treats --end-date as exclusive, so tomorrow includes today.
+    ctx.invoke(
+        extract,
+        start_date=datetime.combine(start, datetime.min.time()),
+        end_date=datetime.combine(today + timedelta(days=1), datetime.min.time()),
+        data_types=(),
+        exclude_data_types=exclude_data_types,
+        db_path=db_path,
+        accounts=tuple(accounts_list or ()),
+        extract_only=False,
+        process_only=False,
+        downsample_older_than=None,
+        downsample_grain=None,
+        prune_older_than=None,
+    )
 
 
 def _group_files_by_user_and_timestamp(

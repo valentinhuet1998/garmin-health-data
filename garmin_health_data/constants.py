@@ -170,6 +170,36 @@ class GarminDataRegistry:
                 "freeform notes, ovulation and baby-movement flags.",
                 "🩸",
             ),
+            GarminDataType(
+                "DAILY_SUMMARY",
+                "get_daily_summary",
+                APIMethodTimeParam.DAILY,
+                "/usersummary-service/usersummary/daily?calendarDate={date}",
+                "Personal API only. Daily wellness summary: steps, distance, floors, "
+                "calories, active/sedentary time, intensity minutes, resting/min/max "
+                "heart rate, stress breakdown, body battery (at wake, high, low, "
+                "charged, drained, feedback), SpO2 and respiration aggregates.",
+                "📅",
+            ),
+            GarminDataType(
+                "HRV",
+                "get_hrv_data",
+                APIMethodTimeParam.DAILY,
+                "/hrv-service/hrv/{date}",
+                "Personal API only. Nightly HRV status (last-night and weekly "
+                "averages, baseline range, status) and the overnight HRV readings "
+                "(about every 5 minutes), linked to the sleep session.",
+                "💗",
+            ),
+            GarminDataType(
+                "NUTRITION",
+                "get_food_logs",
+                APIMethodTimeParam.DAILY,
+                "/nutrition-service/food/logs/{date}",
+                "Personal API only. Logged foods and meals for the day (only days with "
+                "at least one entry are saved).",
+                "🍽️",
+            ),
             # Range Data - Date range parameters: get_method(start_str, end_str)
             GarminDataType(
                 "BODY_COMPOSITION",
@@ -213,6 +243,27 @@ class GarminDataRegistry:
                 "Numerous aggregated metrics for user-recorded activities.",
                 "📋",
             ),
+            GarminDataType(
+                "BODY_BATTERY",
+                "get_body_battery",
+                APIMethodTimeParam.RANGE,
+                "/wellness-service/wellness/bodyBattery/reports/daily"
+                "?startDate={start}&endDate={end}&chunks=288",
+                "Personal API only. Body battery level (3 mins interval time-series) "
+                "and impact events (sleep, activities, naps) with their charge or "
+                "drain. Fetched in windows of at most 31 days.",
+                "🔋",
+            ),
+            GarminDataType(
+                "FITNESS_AGE",
+                "get_fitness_age",
+                APIMethodTimeParam.RANGE,
+                "/fitnessage-service/fitnessage/v2/{date}",
+                "Personal API only. Fitness age estimate and its components (BMI, "
+                "resting heart rate, vigorous activity), sampled weekly plus the last "
+                "day of the range.",
+                "🧬",
+            ),
             # No Date Data - No date parameters: get_method()
             # In case of backfilling, comment out PERSONAL_RECORD data type, since PRs
             # reference activity IDs that may not exist yet.
@@ -242,6 +293,15 @@ class GarminDataRegistry:
                 "rate).",
                 "👤",
             ),
+            GarminDataType(
+                "HR_ZONES",
+                "get_heart_rate_zones",
+                APIMethodTimeParam.NO_DATE,
+                "/biometric-service/heartRateZones/v2",
+                "Personal API only. Current heart rate zones per sport, with the "
+                "lactate threshold, max and resting heart rate they are based on.",
+                "🎯",
+            ),
             # Per-Activity Data - Activity ID parameter: get_method(activity_id).
             # Iterated per activity (not per calendar date) by
             # ``GarminExtractor.extract_fit_activities``, which sources the activity
@@ -265,6 +325,15 @@ class GarminDataRegistry:
                 "parent, fetched via the parent's metadataDTO.childIds. Each leg "
                 "carries its own sport-specific summary metrics.",
                 "🔀",
+            ),
+            GarminDataType(
+                "ACTIVITY_WORKOUT",
+                "get_activity_workouts",
+                APIMethodTimeParam.PER_ACTIVITY,
+                "/activity-service/activity/{activity_id}/workouts",
+                "Personal API only. Structured workout followed during an activity: "
+                "name, sport, and planned steps with durations and targets.",
+                "📝",
             ),
             GarminDataType(
                 "ACTIVITY",

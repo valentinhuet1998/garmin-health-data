@@ -7,9 +7,9 @@ Handles SQLite database creation, session management, and query utilities.
 import sqlite3
 import sys
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional, Union
 
 import click
 from sqlalchemy import create_engine, event, func, select
@@ -24,8 +24,10 @@ else:
 from garmin_health_data.models import (
     Activity,
     BodyBattery,
+    DailySummary,
     Floors,
     HeartRate,
+    HrvSummary,
     IntensityMinutes,
     Respiration,
     Sleep,
@@ -180,69 +182,63 @@ def initialize_database(db_path: str = "garmin_data.db") -> None:
     )
 
 
-def get_last_update_dates(db_path: str = "garmin_data.db") -> Dict[str, Optional[date]]:
+# (data type, model, column) tracked for the last update date. ``date`` columns are
+# returned as-is, ``datetime`` ones are truncated to their date.
+_LAST_UPDATE_COLUMNS = (
+    ("sleep", Sleep, Sleep.start_ts),
+    ("heart_rate", HeartRate, HeartRate.timestamp),
+    ("activity", Activity, Activity.start_ts),
+    ("stress", Stress, Stress.timestamp),
+    ("body_battery", BodyBattery, BodyBattery.timestamp),
+    ("steps", Steps, Steps.timestamp),
+    ("respiration", Respiration, Respiration.timestamp),
+    ("floors", Floors, Floors.timestamp),
+    ("intensity_minutes", IntensityMinutes, IntensityMinutes.timestamp),
+    ("training_readiness", TrainingReadiness, TrainingReadiness.timestamp),
+    # Personal API data types.
+    ("daily_summary", DailySummary, DailySummary.date),
+    ("hrv_summary", HrvSummary, HrvSummary.date),
+)
+
+
+def get_last_update_dates(
+    db_path: str = "garmin_data.db",
+    user_ids: Optional[Iterable[Union[int, str]]] = None,
+) -> Dict[str, Optional[date]]:
     """
     Get the last update date for each data type.
 
     :param db_path: Path to SQLite database file.
+    :param user_ids: Optional Garmin user IDs to restrict the lookup to. If None, all
+        accounts stored in the database are considered.
     :return: Dictionary mapping data type name to last update date.
     """
+    ids = [int(u) for u in user_ids] if user_ids is not None else None
     with get_session(db_path) as session:
-        dates = {}
-
-        # Sleep data.
-        last_sleep = session.execute(select(func.max(Sleep.start_ts))).scalar()
-        dates["sleep"] = last_sleep.date() if last_sleep else None
-
-        # Heart rate.
-        last_hr = session.execute(select(func.max(HeartRate.timestamp))).scalar()
-        dates["heart_rate"] = last_hr.date() if last_hr else None
-
-        # Activities.
-        last_activity = session.execute(select(func.max(Activity.start_ts))).scalar()
-        dates["activity"] = last_activity.date() if last_activity else None
-
-        # Stress.
-        last_stress = session.execute(select(func.max(Stress.timestamp))).scalar()
-        dates["stress"] = last_stress.date() if last_stress else None
-
-        # Body battery.
-        last_bb = session.execute(select(func.max(BodyBattery.timestamp))).scalar()
-        dates["body_battery"] = last_bb.date() if last_bb else None
-
-        # Steps.
-        last_steps = session.execute(select(func.max(Steps.timestamp))).scalar()
-        dates["steps"] = last_steps.date() if last_steps else None
-
-        # Respiration.
-        last_resp = session.execute(select(func.max(Respiration.timestamp))).scalar()
-        dates["respiration"] = last_resp.date() if last_resp else None
-
-        # Floors.
-        last_floors = session.execute(select(func.max(Floors.timestamp))).scalar()
-        dates["floors"] = last_floors.date() if last_floors else None
-
-        # Intensity minutes.
-        last_im = session.execute(select(func.max(IntensityMinutes.timestamp))).scalar()
-        dates["intensity_minutes"] = last_im.date() if last_im else None
-
-        # Training readiness.
-        last_tr = session.execute(
-            select(func.max(TrainingReadiness.timestamp))
-        ).scalar()
-        dates["training_readiness"] = last_tr.date() if last_tr else None
-
+        dates: Dict[str, Optional[date]] = {}
+        for name, model, column in _LAST_UPDATE_COLUMNS:
+            query = select(func.max(column))
+            if ids is not None:
+                query = query.where(model.user_id.in_(ids))
+            value = session.execute(query).scalar()
+            if isinstance(value, datetime):
+                value = value.date()
+            dates[name] = value
         return dates
 
 
-def get_latest_date(db_path: str = "garmin_data.db") -> Optional[date]:
+def get_latest_date(
+    db_path: str = "garmin_data.db",
+    user_ids: Optional[Iterable[Union[int, str]]] = None,
+) -> Optional[date]:
     """
     Get the most recent date across all data types.
 
     :param db_path: Path to SQLite database file.
-    :return: Most recent date or None if database is empty.
+    :param user_ids: Optional Garmin user IDs to restrict the lookup to.
+    :return: Most recent date or None if database is empty (for these accounts).
     """
-    dates = get_last_update_dates(db_path)
+    dates = get_last_update_dates(db_path, user_ids)
     valid_dates = [d for d in dates.values() if d is not None]
 
     if not valid_dates:
@@ -282,6 +278,12 @@ def get_record_counts(db_path: str = "garmin_data.db") -> Dict[str, int]:
         ).scalar()
         counts["respiration_readings"] = session.execute(
             select(func.count(Respiration.timestamp))
+        ).scalar()
+        counts["daily_summaries"] = session.execute(
+            select(func.count(DailySummary.date))
+        ).scalar()
+        counts["hrv_summaries"] = session.execute(
+            select(func.count(HrvSummary.date))
         ).scalar()
 
         return counts

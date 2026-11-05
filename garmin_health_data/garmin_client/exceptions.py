@@ -10,6 +10,7 @@ __all__ = [
     "GarminAuthenticationError",
     "GarminConnectionError",
     "GarminTooManyRequestsError",
+    "GarminUnsupportedEndpointError",
 ]
 
 
@@ -43,4 +44,15 @@ class GarminTooManyRequestsError(GarminConnectionError):
     Subclass of ``GarminConnectionError`` so callers that want to handle all connection
     problems uniformly can catch the parent class while callers that care about rate
     limiting specifically can catch this subclass.
+    """
+
+
+class GarminUnsupportedEndpointError(Exception):
+    """
+    No configured authentication method can reach the requested endpoint.
+
+    Raised by :class:`HybridClient` when a data type is only served by the
+    email/password (SSO) API but the account is authenticated with a Personal API key
+    alone. Deliberately not a ``GarminConnectionError`` subclass so the extractor's
+    retry loop does not retry it.
     """

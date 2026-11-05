@@ -40,17 +40,24 @@ from garmin_health_data.models import (
     ActivityPath,
     ActivitySplitMetric,
     ActivityTsMetric,
+    ActivityWorkout,
     BodyBattery,
+    BodyBatteryEvent,
     BodyComposition,
     BreathingDisruption,
     CyclingAggMetrics,
+    DailySummary,
     Floors,
+    FitnessAge,
     HeartRate,
+    HeartRateZone,
     HRV,
+    HrvSummary,
     IntensityMinutes,
     MenstrualCycleDay,
     MenstrualCycleSummary,
     MenstrualCycleTag,
+    NutritionLog,
     PersonalRecord,
     RacePredictions,
     Respiration,
@@ -206,6 +213,61 @@ _FIT_SESSION_POSITION_PAIR_METRICS = [
 ]
 
 
+# DAILY_SUMMARY scalar fields stored 1:1 in ``daily_summary`` (column = snake_case of
+# the camelCase Garmin field name).
+_DAILY_SUMMARY_FIELDS = [
+    "totalSteps",
+    "dailyStepGoal",
+    "totalDistanceMeters",
+    "floorsAscended",
+    "floorsDescended",
+    "userFloorsAscendedGoal",
+    "totalKilocalories",
+    "activeKilocalories",
+    "bmrKilocalories",
+    "consumedKilocalories",
+    "activeSeconds",
+    "highlyActiveSeconds",
+    "sedentarySeconds",
+    "sleepingSeconds",
+    "measurableAsleepDuration",
+    "measurableAwakeDuration",
+    "moderateIntensityMinutes",
+    "vigorousIntensityMinutes",
+    "intensityMinutesGoal",
+    "restingHeartRate",
+    "minHeartRate",
+    "maxHeartRate",
+    "lastSevenDaysAvgRestingHeartRate",
+    "averageStressLevel",
+    "maxStressLevel",
+    "stressQualifier",
+    "restStressDuration",
+    "lowStressDuration",
+    "mediumStressDuration",
+    "highStressDuration",
+    "activityStressDuration",
+    "uncategorizedStressDuration",
+    "totalStressDuration",
+    "bodyBatteryAtWakeTime",
+    "bodyBatteryHighestValue",
+    "bodyBatteryLowestValue",
+    "bodyBatteryMostRecentValue",
+    "bodyBatteryChargedValue",
+    "bodyBatteryDrainedValue",
+    "bodyBatteryDuringSleep",
+    "averageSpo2",
+    "lowestSpo2",
+    "latestSpo2",
+    "avgWakingRespirationValue",
+    "highestRespirationValue",
+    "lowestRespirationValue",
+    "includesWellnessData",
+    "includesActivityData",
+    "source",
+]
+
+
 class GarminProcessor(Processor):
     """
     Custom processor for Garmin Connect data files.
@@ -269,6 +331,8 @@ class GarminProcessor(Processor):
                 # its legs (which FK-reference it via parent_activity_id) are inserted.
                 ("MULTISPORT_CHILDREN", self._process_multisport_children),
                 ("EXERCISE_SETS", self._process_exercise_sets),
+                # After ACTIVITIES_LIST: workouts FK-reference the activity row.
+                ("ACTIVITY_WORKOUT", self._process_activity_workout),
                 ("BODY_COMPOSITION", self._process_body_composition),
                 ("RUNNING_TOLERANCE", self._process_running_tolerance),
                 ("FLOORS", self._process_floors),
@@ -280,10 +344,17 @@ class GarminProcessor(Processor):
                 ("RACE_PREDICTIONS", self._process_race_predictions),
                 ("RESPIRATION", self._process_respiration),
                 ("SLEEP", self._process_sleep),
+                # After SLEEP so the night's sleep row exists for the HRV readings.
+                ("HRV", self._process_hrv),
                 ("STEPS", self._process_steps),
                 ("STRESS", self._process_stress_body_battery),
                 ("TRAINING_STATUS", self._process_training_status),
                 ("TRAINING_READINESS", self._process_training_readiness),
+                ("DAILY_SUMMARY", self._process_daily_summary),
+                ("BODY_BATTERY", self._process_body_battery),
+                ("FITNESS_AGE", self._process_fitness_age),
+                ("HR_ZONES", self._process_hr_zones),
+                ("NUTRITION", self._process_nutrition),
                 ("ACTIVITY", self._process_activity_file),
             ]
         )
@@ -3424,6 +3495,419 @@ class GarminProcessor(Processor):
                     "ℹ️ No HRV data found, skipping activity_hrv materialization.",
                     fg="blue",
                 )
+
+    # ------------------------------------------------------------------------------------
+    # PERSONAL API DATA TYPES
+    # ------------------------------------------------------------------------------------
+
+    def _process_daily_summary(self, file_path: Path, session: Session) -> None:
+        """
+        Process a DAILY_SUMMARY file into the ``daily_summary`` table.
+
+        Upserts one row per ``(user_id, date)`` so a re-sync of a partially-elapsed day
+        (e.g. today) refreshes the aggregates.
+
+        :param file_path: Path to the DAILY_SUMMARY JSON file.
+        :param session: SQLAlchemy Session object.
+        """
+        data = self._load_json_file(file_path)
+        calendar_date = data.get("calendarDate") if isinstance(data, dict) else None
+        if not calendar_date:
+            click.secho("⚠️ No daily summary data found.", fg="yellow")
+            return
+
+        record = {
+            "user_id": int(self.user_id),
+            "date": self._parse_date_string(calendar_date),
+        }
+        for field_name in _DAILY_SUMMARY_FIELDS:
+            record[self._convert_field_name(field_name)] = data.get(field_name)
+
+        feedback = data.get("bodyBatteryDynamicFeedbackEvent") or {}
+        end_of_day = data.get("endOfDayBodyBatteryDynamicFeedbackEvent") or {}
+        record.update(
+            {
+                "body_battery_feedback_short": feedback.get("feedbackShortType"),
+                "body_battery_feedback_long": feedback.get("feedbackLongType"),
+                "body_battery_end_of_day_feedback_short": end_of_day.get(
+                    "feedbackShortType"
+                ),
+                "body_battery_end_of_day_feedback_long": end_of_day.get(
+                    "feedbackLongType"
+                ),
+            }
+        )
+
+        upsert_model_instances(
+            session=session,
+            model_instances=[DailySummary(**record)],
+            conflict_columns=["user_id", "date"],
+            on_conflict_update=True,
+        )
+        click.echo(f"Processed daily summary for {calendar_date}.")
+
+    def _process_hrv(self, file_path: Path, session: Session) -> None:
+        """
+        Process an HRV file: nightly status into ``hrv_summary``, readings into ``hrv``.
+
+        The overnight readings are linked to the sleep session starting at the HRV
+        payload's ``sleepStartTimestampGMT`` (within 5 minutes). The matching sleep row
+        also gets its ``avg_overnight_hrv`` / ``hrv_status`` filled. Runs after SLEEP
+        in the FileSet so that night's sleep row already exists; without one, the
+        summary is still stored but the readings are skipped.
+
+        :param file_path: Path to the HRV JSON file.
+        :param session: SQLAlchemy Session object.
+        """
+        data = self._load_json_file(file_path)
+        summary = (data.get("hrvSummary") if isinstance(data, dict) else None) or {}
+        calendar_date = summary.get("calendarDate")
+        if not calendar_date:
+            click.secho("⚠️ No HRV summary found.", fg="yellow")
+            return
+
+        sleep_start_str = data.get("sleepStartTimestampGMT")
+        sleep_end_str = data.get("sleepEndTimestampGMT")
+        sleep_start = (
+            self._parse_garmin_gmt(sleep_start_str)
+            if isinstance(sleep_start_str, str)
+            else None
+        )
+        sleep_end = (
+            self._parse_garmin_gmt(sleep_end_str)
+            if isinstance(sleep_end_str, str)
+            else None
+        )
+        baseline = summary.get("baseline") or {}
+
+        upsert_model_instances(
+            session=session,
+            model_instances=[
+                HrvSummary(
+                    user_id=int(self.user_id),
+                    date=self._parse_date_string(calendar_date),
+                    last_night_avg=summary.get("lastNightAvg"),
+                    last_night_5min_high=summary.get("lastNight5MinHigh"),
+                    weekly_avg=summary.get("weeklyAvg"),
+                    status=summary.get("status"),
+                    feedback_phrase=summary.get("feedbackPhrase"),
+                    baseline_low_upper=baseline.get("lowUpper"),
+                    baseline_balanced_low=baseline.get("balancedLow"),
+                    baseline_balanced_upper=baseline.get("balancedUpper"),
+                    baseline_marker_value=baseline.get("markerValue"),
+                    sleep_start_ts=sleep_start,
+                    sleep_end_ts=sleep_end,
+                )
+            ],
+            conflict_columns=["user_id", "date"],
+            on_conflict_update=True,
+        )
+        click.echo(f"Processed HRV summary for {calendar_date}.")
+
+        readings = data.get("hrvReadings") or []
+        if not readings or sleep_start is None:
+            return
+
+        tolerance = timedelta(minutes=5)
+        sleep = (
+            session.execute(
+                select(Sleep).where(
+                    and_(
+                        Sleep.user_id == int(self.user_id),
+                        Sleep.start_ts >= sleep_start - tolerance,
+                        Sleep.start_ts <= sleep_start + tolerance,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if sleep is None:
+            click.secho(
+                f"⚠️ No sleep session starting at {sleep_start_str} for HRV "
+                f"{calendar_date}; overnight readings not stored.",
+                fg="yellow",
+            )
+            return
+
+        if sleep.avg_overnight_hrv is None:
+            sleep.avg_overnight_hrv = summary.get("lastNightAvg")
+        if sleep.hrv_status is None:
+            sleep.hrv_status = summary.get("status")
+
+        hrv_records = []
+        for reading in readings:
+            if not isinstance(reading, dict):
+                continue
+            reading_time = reading.get("readingTimeGMT")
+            if not isinstance(reading_time, str):
+                continue
+            hrv_records.append(
+                HRV(
+                    sleep_id=sleep.sleep_id,
+                    timestamp=self._parse_garmin_gmt(reading_time),
+                    value=reading.get("hrvValue"),
+                )
+            )
+        if hrv_records:
+            upsert_model_instances(
+                session=session,
+                model_instances=hrv_records,
+                conflict_columns=["sleep_id", "timestamp"],
+                on_conflict_update=False,
+            )
+            click.echo(f"Processed {len(hrv_records)} HRV records.")
+
+    def _process_body_battery(self, file_path: Path, session: Session) -> None:
+        """
+        Process a BODY_BATTERY file: levels into ``body_battery``, events into
+        ``body_battery_event``.
+
+        Levels are ``[timestamp_ms, level]`` pairs (the level is the last element, so
+        the three-element SSO shape is accepted too); null levels are skipped.
+
+        :param file_path: Path to the BODY_BATTERY JSON file (a list of daily reports).
+        :param session: SQLAlchemy Session object.
+        """
+        payload = self._load_json_file(file_path)
+        reports = payload if isinstance(payload, list) else [payload]
+
+        level_records = []
+        event_records = []
+        for report in reports:
+            if not isinstance(report, dict):
+                continue
+            for value in report.get("bodyBatteryValuesArray") or []:
+                if (
+                    isinstance(value, list)
+                    and len(value) >= 2
+                    and value[0]
+                    and value[-1] is not None
+                ):
+                    level_records.append(
+                        BodyBattery(
+                            user_id=int(self.user_id),
+                            timestamp=datetime.fromtimestamp(
+                                value[0] / 1000, tz=timezone.utc
+                            ),
+                            value=value[-1],
+                        )
+                    )
+            for event in report.get("bodyBatteryActivityEvent") or []:
+                if not isinstance(event, dict):
+                    continue
+                start = event.get("eventStartTimeGmt")
+                event_type = event.get("eventType")
+                if not isinstance(start, str) or not event_type:
+                    continue
+                event_records.append(
+                    BodyBatteryEvent(
+                        user_id=int(self.user_id),
+                        start_ts=self._parse_garmin_gmt(start),
+                        event_type=event_type,
+                        duration_ms=event.get("durationInMilliseconds"),
+                        impact=event.get("bodyBatteryImpact"),
+                        feedback_type=event.get("feedbackType"),
+                        short_feedback=event.get("shortFeedback"),
+                        timezone_offset_ms=event.get("timezoneOffset"),
+                    )
+                )
+
+        if level_records:
+            upsert_model_instances(
+                session=session,
+                model_instances=level_records,
+                conflict_columns=["user_id", "timestamp"],
+                on_conflict_update=False,
+            )
+            click.echo(f"Processed {len(level_records)} body battery records.")
+        else:
+            click.secho("⚠️ No body battery levels found.", fg="yellow")
+        if event_records:
+            upsert_model_instances(
+                session=session,
+                model_instances=event_records,
+                conflict_columns=["user_id", "start_ts", "event_type"],
+                on_conflict_update=True,
+            )
+            click.echo(f"Processed {len(event_records)} body battery events.")
+
+    def _process_fitness_age(self, file_path: Path, session: Session) -> None:
+        """
+        Process a FITNESS_AGE file into the ``fitness_age`` table.
+
+        :param file_path: Path to the FITNESS_AGE JSON file (a list of estimates).
+        :param session: SQLAlchemy Session object.
+        """
+        payload = self._load_json_file(file_path)
+        rows = payload if isinstance(payload, list) else [payload]
+
+        records = []
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("calendarDate"):
+                continue
+            components = row.get("components") or {}
+            last_updated = row.get("lastUpdated")
+            records.append(
+                FitnessAge(
+                    user_id=int(self.user_id),
+                    date=self._parse_date_string(row["calendarDate"]),
+                    fitness_age=row.get("fitnessAge"),
+                    chronological_age=row.get("chronologicalAge"),
+                    previous_fitness_age=row.get("previousFitnessAge"),
+                    bmi=(components.get("bmi") or {}).get("value"),
+                    resting_heart_rate=(components.get("rhr") or {}).get("value"),
+                    vigorous_days_avg=(components.get("vigorousDaysAvg") or {}).get(
+                        "value"
+                    ),
+                    vigorous_minutes_avg=(
+                        components.get("vigorousMinutesAvg") or {}
+                    ).get("value"),
+                    last_updated=(
+                        self._parse_garmin_iso(last_updated)
+                        if isinstance(last_updated, str)
+                        else None
+                    ),
+                )
+            )
+
+        if records:
+            upsert_model_instances(
+                session=session,
+                model_instances=records,
+                conflict_columns=["user_id", "date"],
+                on_conflict_update=True,
+            )
+            click.echo(f"Processed {len(records)} fitness age record(s).")
+        else:
+            click.secho("⚠️ No fitness age data found.", fg="yellow")
+
+    def _process_hr_zones(self, file_path: Path, session: Session) -> None:
+        """
+        Process an HR_ZONES file into the ``heart_rate_zone`` table (one row per sport).
+
+        :param file_path: Path to the HR_ZONES JSON file (a list of zone configs).
+        :param session: SQLAlchemy Session object.
+        """
+        payload = self._load_json_file(file_path)
+        rows = payload if isinstance(payload, list) else []
+
+        records = [
+            HeartRateZone(
+                user_id=int(self.user_id),
+                sport=row["sport"],
+                training_method=row.get("trainingMethod"),
+                lactate_threshold_heart_rate=row.get("lactateThresholdHeartRateUsed"),
+                max_heart_rate=row.get("maxHeartRateUsed"),
+                resting_heart_rate=row.get("restingHeartRateUsed"),
+                resting_hr_auto_update=row.get("restingHrAutoUpdateUsed"),
+                zone1_floor=row.get("zone1Floor"),
+                zone2_floor=row.get("zone2Floor"),
+                zone3_floor=row.get("zone3Floor"),
+                zone4_floor=row.get("zone4Floor"),
+                zone5_floor=row.get("zone5Floor"),
+            )
+            for row in rows
+            if isinstance(row, dict) and row.get("sport")
+        ]
+        if records:
+            upsert_model_instances(
+                session=session,
+                model_instances=records,
+                conflict_columns=["user_id", "sport"],
+                on_conflict_update=True,
+            )
+            click.echo(f"Processed {len(records)} heart rate zone configuration(s).")
+        else:
+            click.secho("⚠️ No heart rate zones found.", fg="yellow")
+
+    def _process_activity_workout(self, file_path: Path, session: Session) -> None:
+        """
+        Process an ACTIVITY_WORKOUT file into the ``activity_workout`` table.
+
+        Replaces the activity's existing workout rows (delete + insert) so a workout
+        detached from the activity in Garmin Connect disappears locally too. Skips the
+        file when the activity row does not exist (e.g. a duplicate skipped by the
+        ACTIVITIES_LIST processor), rather than failing on the foreign key.
+
+        :param file_path: Path to the ACTIVITY_WORKOUT JSON file.
+        :param session: SQLAlchemy Session object.
+        """
+        data = self._load_json_file(file_path)
+        activity_id = data.get("activityId") if isinstance(data, dict) else None
+        workouts = (data.get("workouts") if isinstance(data, dict) else None) or []
+        if not activity_id:
+            click.secho("⚠️ ACTIVITY_WORKOUT file has no activityId.", fg="yellow")
+            return
+        activity_id = int(activity_id)
+        if activity_id in self._skipped_activity_ids or (
+            session.get(Activity, activity_id) is None
+        ):
+            click.secho(
+                f"⚠️ Activity {activity_id} not in the database; skipping its "
+                f"workouts.",
+                fg="yellow",
+            )
+            return
+
+        session.execute(
+            delete(ActivityWorkout).where(ActivityWorkout.activity_id == activity_id)
+        )
+        records = []
+        for position, workout in enumerate(workouts):
+            if not isinstance(workout, dict):
+                continue
+            steps = workout.get("steps")
+            steps = steps if isinstance(steps, list) else []
+            index = workout.get("index")
+            records.append(
+                ActivityWorkout(
+                    activity_id=activity_id,
+                    workout_index=index if isinstance(index, int) else position,
+                    workout_name=workout.get("workoutName"),
+                    sport=workout.get("sport"),
+                    manufacturer=workout.get("manufacturer"),
+                    step_count=len(steps),
+                    steps_json=steps,
+                    time_created=workout.get("timeCreated"),
+                )
+            )
+        if records:
+            session.add_all(records)
+            session.flush()
+            click.echo(
+                f"Processed {len(records)} workout(s) for activity {activity_id}."
+            )
+
+    def _process_nutrition(self, file_path: Path, session: Session) -> None:
+        """
+        Process a NUTRITION file into the ``nutrition_log`` table.
+
+        :param file_path: Path to the NUTRITION JSON file.
+        :param session: SQLAlchemy Session object.
+        """
+        data = self._load_json_file(file_path)
+        meal_date = data.get("mealDate") if isinstance(data, dict) else None
+        if not meal_date:
+            click.secho("⚠️ No nutrition log found.", fg="yellow")
+            return
+        foods = data.get("loggedFoodsWithServingSizes") or []
+        meals = data.get("mealDetails") or []
+        upsert_model_instances(
+            session=session,
+            model_instances=[
+                NutritionLog(
+                    user_id=int(self.user_id),
+                    date=self._parse_date_string(meal_date),
+                    food_count=len(foods) if isinstance(foods, list) else 0,
+                    meal_count=len(meals) if isinstance(meals, list) else 0,
+                    log_json=data,
+                )
+            ],
+            conflict_columns=["user_id", "date"],
+            on_conflict_update=True,
+        )
+        click.echo(f"Processed nutrition log for {meal_date}.")
 
     def _process_fit_file(self, file_path: Path, session: Session):
         """

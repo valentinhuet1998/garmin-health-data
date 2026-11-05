@@ -20,7 +20,12 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import click
 import pendulum
 import requests
-from garmin_health_data.garmin_client import ActivityDownloadFormat, GarminClient
+from garmin_health_data.garmin_client import (
+    ActivityDownloadFormat,
+    GarminClient,
+    HybridClient,
+    PersonalApiClient,
+)
 from garmin_health_data.garmin_client.exceptions import GarminConnectionError
 
 from garmin_health_data.constants import (
@@ -294,6 +299,51 @@ def _split_running_tolerance_by_day(
     return by_day
 
 
+def _split_body_battery_by_day(
+    payload: Optional[List[Dict[str, Any]]],
+) -> Dict[date, List[Dict[str, Any]]]:
+    """
+    Split a ``BODY_BATTERY`` per-range response into per-day payloads.
+
+    The report endpoint returns one object per day carrying its local ``date``. Days
+    without any level or event (watch not worn) are dropped so no empty file lands.
+
+    :param payload: Full range response from ``get_body_battery`` (a list).
+    :return: Mapping ``{date: [the report for that day]}``.
+    """
+    by_day: Dict[date, List[Dict[str, Any]]] = {}
+    for report in payload or []:
+        if not isinstance(report, dict):
+            continue
+        has_levels = any(
+            isinstance(v, list) and len(v) >= 2 and v[-1] is not None
+            for v in report.get("bodyBatteryValuesArray") or []
+        )
+        if not has_levels and not report.get("bodyBatteryActivityEvent"):
+            continue
+        day_str = report.get("date")
+        if not isinstance(day_str, str):
+            continue
+        try:
+            day = date.fromisoformat(day_str[:10])
+        except ValueError:
+            continue
+        by_day.setdefault(day, []).append(report)
+    return by_day
+
+
+def _split_by_calendar_date(
+    payload: Optional[List[Dict[str, Any]]],
+) -> Dict[date, List[Dict[str, Any]]]:
+    """
+    Split a list of rows carrying ``calendarDate`` into per-day payloads.
+
+    :param payload: List of row dictionaries.
+    :return: Mapping ``{date: [...rows of that day...]}``.
+    """
+    return _split_running_tolerance_by_day(payload)
+
+
 # Registry of per-day splitters: data types listed here have their per-range API
 # responses split into one file per day before write. RANGE types not listed
 # write one file stamped with end_date (current behavior — appropriate when the
@@ -303,6 +353,8 @@ _PER_DAY_SPLITTERS: Dict[str, Callable[[Any], Dict[date, Any]]] = {
     "BODY_COMPOSITION": _split_body_composition_by_day,
     "ACTIVITIES_LIST": _split_activities_list_by_day,
     "RUNNING_TOLERANCE": _split_running_tolerance_by_day,
+    "BODY_BATTERY": _split_body_battery_by_day,
+    "FITNESS_AGE": _split_by_calendar_date,
 }
 
 
@@ -406,19 +458,45 @@ class GarminExtractor:
         self.garmin_client = None
         self.user_id = None
         self.failures: List[ExtractionFailure] = []
+        # Data types skipped because no configured auth method serves them (e.g.
+        # TRAINING_STATUS with only a Personal API key). Not failures.
+        self.skipped_data_types: List[str] = []
 
-    def authenticate(self, token_store_dir: str = "~/.garminconnect") -> None:
+    def _client_supports(self, method_name: str) -> bool:
         """
-        Authenticate with Garmin Connect using pre-existing tokens.
+        Report whether the authenticated client can serve an API method.
 
-        This function relies on OAuth tokens that have been previously saved
-        by the ``garmin auth`` command. The library automatically handles
-        token validation and session management once valid tokens are present.
+        Clients without a ``supports`` method (plain ``GarminClient``, test doubles) are
+        assumed to serve everything.
+
+        :param method_name: Extractor-facing API method name.
+        :return: True if the method can be called.
+        """
+        supports = getattr(self.garmin_client, "supports", None)
+        return True if supports is None else bool(supports(method_name))
+
+    def authenticate(
+        self,
+        token_store_dir: str = "~/.garminconnect",
+        personal_client: Optional[PersonalApiClient] = None,
+    ) -> None:
+        """
+        Authenticate with Garmin Connect using a Personal API key and/or SSO tokens.
+
+        Builds a :class:`HybridClient` from up to two sources:
+
+        - A Personal API key: ``personal_client`` when given (already authenticated,
+          e.g. from ``GARMIN_PERSONAL_API_KEY``), otherwise the ``personal_api_key``
+          file saved in ``token_store_dir`` by ``garmin auth``.
+        - SSO OAuth tokens (``garmin_tokens.json``) saved by ``garmin auth --sso``.
+
+        Data types the Personal API serves go through it; the rest use the SSO tokens
+        when present. A failure of one source is only a warning when the other works.
 
         Sets both self.garmin_client and self.user_id upon successful
         authentication.
 
-        Token Lifecycle:
+        SSO token lifecycle:
         - Tokens are stored in ~/.garminconnect/<user_id>/ per account.
         - Access tokens (~18h) are auto-refreshed using the refresh token
           (30 days).
@@ -432,41 +510,69 @@ class GarminExtractor:
         - Authentication errors occur during extraction.
 
         :param token_store_dir: Per-account directory containing
-            ``garmin_tokens.json`` (e.g. ``~/.garminconnect/12345678/``).
-            Must point to the account-level subdirectory, not the root
-            ``~/.garminconnect/`` directory. In normal usage this is always
-            supplied by the caller; the default is a placeholder that will
-            fail unless a ``garmin_tokens.json`` happens to exist there.
-        :raises RuntimeError: If tokens are missing, expired, or invalid. Run
-            ``garmin auth`` to resolve authentication issues.
+            ``personal_api_key`` and/or ``garmin_tokens.json`` (e.g.
+            ``~/.garminconnect/12345678/``). Must point to the account-level
+            subdirectory, not the root ``~/.garminconnect/`` directory. In normal
+            usage this is always supplied by the caller.
+        :param personal_client: Optional already-authenticated Personal API client
+            for this account; takes precedence over a saved key file.
+        :raises RuntimeError: If no credential source works. Run ``garmin auth`` to
+            resolve authentication issues.
         """
-        token_store_path = Path(token_store_dir).expanduser()
-        click.echo("Authenticating with Garmin Connect using saved tokens.")
+        from garmin_health_data.auth import has_sso_tokens, load_account_api_key
 
-        try:
-            garmin = GarminClient.from_tokens(token_store_path)
-            self.garmin_client = garmin
-            click.secho(
-                f"Authentication successful for {self.garmin_client.full_name}"
-                f" using saved tokens.",
-                fg="green",
-            )
-        except Exception as e:
+        token_store_path = Path(token_store_dir).expanduser()
+        click.echo("Authenticating with Garmin Connect.")
+        errors: List[str] = []
+
+        personal = personal_client
+        if personal is None:
+            api_key = load_account_api_key(token_store_path)
+            if api_key:
+                try:
+                    personal = PersonalApiClient(api_key)
+                    _with_retries(personal.authenticate)
+                except Exception as e:
+                    personal = None
+                    errors.append(f"Personal API key: {e}")
+
+        sso = None
+        if has_sso_tokens(token_store_path):
+            try:
+                sso = GarminClient.from_tokens(token_store_path)
+            except Exception as e:
+                errors.append(f"Email/password tokens: {e}")
+
+        if personal is None and sso is None:
+            reason = "; ".join(errors) or "no API key or tokens found"
             error_msg = (
-                f"Garmin authentication failed: {str(e)}\n\n"
+                f"Garmin authentication failed: {reason}\n\n"
                 "To resolve this issue, run:\n"
-                "   garmin auth\n\n"
-                "This will:\n"
-                "   - Guide you through Garmin Connect login.\n"
-                "   - Handle MFA if enabled on your account.\n"
-                "   - Save fresh tokens for future use.\n\n"
-                f"Expected token location: {token_store_path}."
+                "   garmin auth          (Personal API key)\n"
+                "   garmin auth --sso    (email/password, for the data types the "
+                "Personal API does not serve)\n\n"
+                f"Expected credential location: {token_store_path}."
             )
             click.secho(error_msg, fg="red")
-            raise RuntimeError(error_msg) from e
+            raise RuntimeError(error_msg)
 
-        # Get user ID for later use.
-        self.user_id = self.garmin_client.get_user_profile().get("id")
+        for error in errors:
+            click.secho(f"⚠️  {error}. Continuing with the other method.", fg="yellow")
+
+        self.garmin_client = HybridClient(personal=personal, sso=sso)
+
+        # Get user ID for later use. The Personal API resolves it during
+        # authentication; the SSO API reports it in the user settings.
+        if personal is not None:
+            self.user_id = personal.user_id
+        else:
+            self.user_id = sso.get_user_profile().get("id")
+
+        click.secho(
+            f"Authentication successful for user {self.user_id} "
+            f"({self.garmin_client.auth_methods}).",
+            fg="green",
+        )
 
     def _get_data_types_to_extract(
         self, data_types: Optional[List[str]] = None
@@ -552,6 +658,12 @@ class GarminExtractor:
         saved_files = []
 
         for data_type in data_types_to_extract:
+            # Skip types no configured auth method can serve (e.g. TRAINING_STATUS
+            # with only a Personal API key). Recorded for one summary line, not as
+            # failures, since nothing went wrong.
+            if not self._client_supports(data_type.api_method):
+                self.skipped_data_types.append(data_type.name)
+                continue
             try:
                 files = self._extract_data_by_type(
                     data_type, self.start_date, self.end_date
@@ -570,6 +682,28 @@ class GarminExtractor:
                         activity_id="",
                         error=f"{type(e).__name__}: {e}",
                     )
+                )
+
+        if self.skipped_data_types:
+            registry = {dt.name: dt for dt in GARMIN_DATA_REGISTRY.all_data_types}
+            need_key = [
+                name
+                for name in self.skipped_data_types
+                if registry[name].api_method in PersonalApiClient.SUPPORTED_METHODS
+            ]
+            need_sso = [n for n in self.skipped_data_types if n not in need_key]
+            if need_sso:
+                click.secho(
+                    f"⏭️  Skipped (not served by the Personal API): "
+                    f"{', '.join(need_sso)}. Run 'garmin auth --sso' to also log in "
+                    f"with email/password and extract them.",
+                    fg="yellow",
+                )
+            if need_key:
+                click.secho(
+                    f"⏭️  Skipped (Personal API only): {', '.join(need_key)}. Run "
+                    f"'garmin auth' to set up a Personal API key and extract them.",
+                    fg="yellow",
                 )
 
         return saved_files
@@ -764,6 +898,26 @@ class GarminExtractor:
         :param end_date: End of the dayview window (inclusive).
         :return: whether to run the per-day fan-out (``True``) or skip it (``False``).
         """
+        # The calendar endpoint is not served by the Personal API. Without SSO tokens,
+        # probe the Personal API cycle summary for the window end instead: accounts
+        # that track cycles always have a (logged or predicted) cycle covering today,
+        # while non-tracking accounts get an empty response. Fails open.
+        if not self._client_supports("get_menstrual_calendar_data"):
+            if not self._client_supports("get_menstrual_cycle_summary"):
+                return True
+            try:
+                summary = _with_retries(
+                    self.garmin_client.get_menstrual_cycle_summary,
+                    end_date.strftime("%Y-%m-%d"),
+                )
+            except Exception as e:
+                click.secho(
+                    f"⚠️  MENSTRUAL_CYCLE_DAY summary probe failed "
+                    f"({type(e).__name__}: {e}); running the full window.",
+                    fg="yellow",
+                )
+                return True
+            return bool(summary)
         try:
             summary = _with_retries(
                 self.garmin_client.get_menstrual_calendar_data,
@@ -1123,6 +1277,19 @@ class GarminExtractor:
         want_multisport = (
             self.data_types is None or "MULTISPORT_CHILDREN" in self.data_types
         )
+        # Exercise sets and legs ride along with ACTIVITY. Each sub-fetch is then
+        # gated on the client serving it (the Personal API does not serve exercise
+        # sets, for instance).
+        fetch_exercise_sets = (
+            want_activity or want_exercise_sets
+        ) and self._client_supports("get_activity_exercise_sets")
+        fetch_multisport = (want_activity or want_multisport) and self._client_supports(
+            "get_activity_details"
+        )
+        fetch_workouts = (
+            self.data_types is None or "ACTIVITY_WORKOUT" in self.data_types
+        ) and self._client_supports("get_activity_workouts")
+        want_activity = want_activity and self._client_supports("download_activity")
 
         for activity in activities:
             activity_id = activity["activityId"]
@@ -1188,7 +1355,7 @@ class GarminExtractor:
             activity_type_key = (
                 activity.get("activityType", {}).get("typeKey", "").lower()
             )
-            if (want_activity or want_exercise_sets) and activity_type_key in (
+            if fetch_exercise_sets and activity_type_key in (
                 "strength_training",
                 "fitness_equipment",
             ):
@@ -1202,13 +1369,21 @@ class GarminExtractor:
             # marks any activity that has child legs (structural signal, not a
             # hardcoded type name); the authoritative child list comes from the detail
             # endpoint's metadataDTO.childIds.
-            if (want_activity or want_multisport) and activity.get("parent") is True:
+            if fetch_multisport and activity.get("parent") is True:
                 time.sleep(0.1)
                 children_file = self._extract_multisport_children(
                     activity_id, timestamp
                 )
                 if children_file:
                     downloaded_files.append(children_file)
+
+            # Fetch the structured workout the activity followed, if any (Personal
+            # API only).
+            if fetch_workouts:
+                time.sleep(0.1)
+                workout_file = self._extract_activity_workouts(activity_id, timestamp)
+                if workout_file:
+                    downloaded_files.append(workout_file)
 
             # Rate limiting between activities.
             time.sleep(0.1)
@@ -1257,6 +1432,40 @@ class GarminExtractor:
 
         file_size = filepath.stat().st_size / 1024  # KB.
         click.echo(f"Saved: {filename} ({file_size:.1f} KB).")
+        return filepath
+
+    def _extract_activity_workouts(
+        self, activity_id: int, timestamp: str
+    ) -> Optional[Path]:
+        """
+        Fetch and save the structured workouts an activity followed.
+
+        Saves ``{"activityId": ..., "workouts": [...]}`` so the processor can link the
+        workouts to the activity. Returns None (no file) when the activity followed no
+        structured workout or the call fails.
+
+        :param activity_id: Garmin activity ID.
+        :param timestamp: ISO 8601 timestamp for consistent filename batching.
+        :return: Path to the saved JSON file, or None.
+        """
+        try:
+            workouts = _with_retries(
+                self.garmin_client.get_activity_workouts, activity_id
+            )
+        except Exception as e:
+            click.secho(
+                f"Warning: Failed to fetch workouts for activity {activity_id}: {e}.",
+                fg="yellow",
+            )
+            return None
+        if not isinstance(workouts, list) or not workouts:
+            return None
+
+        filename = f"{self.user_id}_ACTIVITY_WORKOUT_{activity_id}_{timestamp}.json"
+        filepath = self.ingest_dir / filename
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump({"activityId": activity_id, "workouts": workouts}, f, indent=2)
+        click.echo(f"Saved workout(s) for activity {activity_id}: {filename}.")
         return filepath
 
     def _extract_multisport_children(
@@ -1438,23 +1647,52 @@ def extract(
             "failed_accounts": [],
         }
 
-    # Discover accounts.
-    from garmin_health_data.auth import discover_accounts
+    # Discover accounts: per-account directories under ~/.garminconnect/ (SSO tokens
+    # and/or a saved Personal API key), plus the account owning a Personal API key
+    # set in GARMIN_PERSONAL_API_KEY or ./.env.
+    from garmin_health_data.auth import discover_accounts, read_env_api_key
 
+    empty_result: Dict[str, Any] = {
+        "garmin_files": 0,
+        "activity_files": 0,
+        "failures": [],
+        "failed_accounts": [],
+    }
+
+    discovered: List[tuple] = []
+    discovery_error: Optional[Exception] = None
     try:
         discovered = discover_accounts()
     except (FileNotFoundError, NotADirectoryError, RuntimeError) as e:
+        discovery_error = e
+
+    env_personal_clients: Dict[str, PersonalApiClient] = {}
+    env_api_key = read_env_api_key()
+    if env_api_key:
+        try:
+            env_client = PersonalApiClient(env_api_key)
+            _with_retries(env_client.authenticate)
+            env_user_id = str(env_client.user_id)
+            env_personal_clients[env_user_id] = env_client
+            if env_user_id not in {uid for uid, _ in discovered}:
+                discovered.append(
+                    (env_user_id, Path("~/.garminconnect").expanduser() / env_user_id)
+                )
+        except Exception as e:
+            click.secho(
+                f"⚠️  Personal API key from GARMIN_PERSONAL_API_KEY / .env could not "
+                f"be used: {type(e).__name__}: {e}",
+                fg="red",
+            )
+
+    if not discovered:
+        reason = f"{discovery_error}\n" if discovery_error else ""
         click.secho(
-            f"Account discovery failed: {e}\n"
+            f"Account discovery failed: {reason}"
             "Run 'garmin auth' to set up your Garmin account(s).",
             fg="red",
         )
-        return {
-            "garmin_files": 0,
-            "activity_files": 0,
-            "failures": [],
-            "failed_accounts": [],
-        }
+        return empty_result
 
     # Apply account filter if provided.
     if accounts is not None:
@@ -1489,7 +1727,10 @@ def extract(
             )
 
             extractor = GarminExtractor(start_date, end_date, ingest_dir, data_types)
-            extractor.authenticate(token_store_dir=str(token_dir))
+            extractor.authenticate(
+                token_store_dir=str(token_dir),
+                personal_client=env_personal_clients.get(user_id),
+            )
 
             # Extract Garmin data.
             if progress_callback:
@@ -1500,7 +1741,12 @@ def extract(
             activity_files = []
             if data_types is None or (
                 data_types
-                and {"ACTIVITY", "EXERCISE_SETS", "MULTISPORT_CHILDREN"}
+                and {
+                    "ACTIVITY",
+                    "EXERCISE_SETS",
+                    "MULTISPORT_CHILDREN",
+                    "ACTIVITY_WORKOUT",
+                }
                 & set(data_types)
             ):
                 if progress_callback:
@@ -1574,6 +1820,61 @@ def extract(
         "failures": all_failures,
         "failed_accounts": failed_accounts,
     }
+
+
+def find_earliest_activity_date(
+    accounts: Optional[List[str]] = None,
+) -> Optional[date]:
+    """
+    Find the oldest recorded activity date across Personal API accounts.
+
+    Used as the start of a full-history ``garmin sync``. Checks the key from
+    ``GARMIN_PERSONAL_API_KEY`` / ``./.env`` and every key saved by ``garmin auth``,
+    restricted to ``accounts`` when given. Accounts that only have email/password
+    tokens are not considered (the SSO client has no cheap oldest-activity lookup).
+
+    :param accounts: Optional list of user_id strings to restrict the search to.
+    :return: The earliest activity date, or None when no key works or no account has
+        activities.
+    """
+    from garmin_health_data.auth import (
+        discover_accounts,
+        load_account_api_key,
+        read_env_api_key,
+    )
+
+    api_keys: List[str] = []
+    env_key = read_env_api_key()
+    if env_key:
+        api_keys.append(env_key)
+    try:
+        for user_id, token_dir in discover_accounts():
+            if accounts is not None and user_id not in accounts:
+                continue
+            saved_key = load_account_api_key(token_dir)
+            if saved_key:
+                api_keys.append(saved_key)
+    except (FileNotFoundError, NotADirectoryError, RuntimeError):
+        pass
+
+    earliest: Optional[date] = None
+    for api_key in dict.fromkeys(api_keys):
+        try:
+            client = PersonalApiClient(api_key)
+            _with_retries(client.authenticate)
+            if accounts is not None and str(client.user_id) not in accounts:
+                continue
+            found = _with_retries(client.get_earliest_activity_date)
+        except Exception as e:
+            click.secho(
+                f"⚠️  Could not look up the oldest activity: {type(e).__name__}: {e}",
+                fg="yellow",
+            )
+            continue
+        if found:
+            found_date = date.fromisoformat(found)
+            earliest = found_date if earliest is None else min(earliest, found_date)
+    return earliest
 
 
 def cli_extract(

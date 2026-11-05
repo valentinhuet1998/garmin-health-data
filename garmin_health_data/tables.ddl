@@ -920,3 +920,191 @@ CREATE TABLE IF NOT EXISTS activity_ts_metric_downsampled (
 -- the wellness time-series tables (heart_rate, body_battery, etc.).
 CREATE INDEX IF NOT EXISTS activity_ts_metric_downsampled_name_bucket_ts_idx
 ON activity_ts_metric_downsampled (name, bucket_ts DESC);
+
+/*
+========================================================================================
+PERSONAL API DATA
+========================================================================================
+Tables populated from Garmin Personal API endpoints (API-key authentication) that the
+email/password pipeline above does not cover: per-day wellness summaries, HRV status,
+body battery events, fitness age, heart rate zones, structured workouts and nutrition.
+========================================================================================
+*/
+
+-- Daily wellness summary (one row per user and calendar day) from the Personal API usersummary endpoint: steps, distance, floors, calories, activity time, intensity minutes, heart rate, stress breakdown, body battery, SpO2 and respiration aggregates. Durations are in seconds.
+CREATE TABLE IF NOT EXISTS daily_summary (
+    user_id BIGINT NOT NULL                     -- References user(user_id). Identifies which user this daily summary belongs to.
+    , date DATE NOT NULL                          -- Calendar date (calendarDate) this row summarizes, in the local time of the user.
+    , total_steps INTEGER                         -- Total steps for the day.
+    , daily_step_goal INTEGER                     -- Step goal for the day.
+    , total_distance_meters INTEGER               -- Total distance covered (walking, running, activities) in meters.
+    , floors_ascended FLOAT                       -- Floors climbed (about 3 m of ascent per floor).
+    , floors_descended FLOAT                      -- Floors descended.
+    , user_floors_ascended_goal INTEGER           -- Floors climbed goal for the day.
+    , total_kilocalories FLOAT                    -- Total calories burned (active + resting).
+    , active_kilocalories FLOAT                   -- Active calories burned.
+    , bmr_kilocalories FLOAT                      -- Resting (basal metabolic rate) calories.
+    , consumed_kilocalories FLOAT                 -- Calories consumed, when logged.
+    , active_seconds INTEGER                      -- Time spent active, in seconds.
+    , highly_active_seconds INTEGER               -- Time spent highly active, in seconds.
+    , sedentary_seconds INTEGER                   -- Time spent sedentary, in seconds.
+    , sleeping_seconds INTEGER                    -- Time spent sleeping, in seconds.
+    , measurable_asleep_duration INTEGER          -- Measurable time asleep, in seconds.
+    , measurable_awake_duration INTEGER           -- Measurable time awake, in seconds.
+    , moderate_intensity_minutes INTEGER          -- Moderate intensity minutes earned this day.
+    , vigorous_intensity_minutes INTEGER          -- Vigorous intensity minutes earned this day (count double toward the weekly goal).
+    , intensity_minutes_goal INTEGER              -- Weekly intensity minutes goal.
+    , resting_heart_rate INTEGER                  -- Resting heart rate in bpm.
+    , min_heart_rate INTEGER                      -- Minimum heart rate of the day in bpm.
+    , max_heart_rate INTEGER                      -- Maximum heart rate of the day in bpm.
+    , last_seven_days_avg_resting_heart_rate INTEGER  -- 7-day average resting heart rate in bpm.
+    , average_stress_level INTEGER                -- Average stress level (0-100).
+    , max_stress_level INTEGER                    -- Maximum stress level (0-100).
+    , stress_qualifier TEXT                       -- Qualitative stress label Garmin gives the day (e.g., BALANCED, STRESSFUL).
+    , rest_stress_duration INTEGER                -- Time in rest stress (0-25), in seconds.
+    , low_stress_duration INTEGER                 -- Time in low stress (26-50), in seconds.
+    , medium_stress_duration INTEGER              -- Time in medium stress (51-75), in seconds.
+    , high_stress_duration INTEGER                -- Time in high stress (76-100), in seconds.
+    , activity_stress_duration INTEGER            -- Time during activities (stress not measured), in seconds.
+    , uncategorized_stress_duration INTEGER       -- Time without a stress measurement, in seconds.
+    , total_stress_duration INTEGER               -- Total time covered by the stress breakdown, in seconds.
+    , body_battery_at_wake_time INTEGER           -- Body battery level at wake time (0-100).
+    , body_battery_highest_value INTEGER          -- Highest body battery level of the day.
+    , body_battery_lowest_value INTEGER           -- Lowest body battery level of the day.
+    , body_battery_most_recent_value INTEGER      -- Most recent body battery level when the summary was fetched.
+    , body_battery_charged_value INTEGER          -- Body battery charged during the day.
+    , body_battery_drained_value INTEGER          -- Body battery drained during the day.
+    , body_battery_during_sleep INTEGER           -- Body battery gained during sleep.
+    , body_battery_feedback_short TEXT            -- Latest body battery feedback code (feedbackShortType).
+    , body_battery_feedback_long TEXT             -- Latest body battery feedback detail (feedbackLongType).
+    , body_battery_end_of_day_feedback_short TEXT -- End-of-day body battery feedback code.
+    , body_battery_end_of_day_feedback_long TEXT  -- End-of-day body battery feedback detail.
+    , average_spo2 FLOAT                          -- Average SpO2 (%).
+    , lowest_spo2 INTEGER                         -- Lowest SpO2 (%).
+    , latest_spo2 INTEGER                         -- Most recent SpO2 reading (%).
+    , avg_waking_respiration_value FLOAT          -- Average waking respiration rate in breaths per minute.
+    , highest_respiration_value FLOAT             -- Highest respiration rate in breaths per minute.
+    , lowest_respiration_value FLOAT              -- Lowest respiration rate in breaths per minute.
+    , includes_wellness_data BOOLEAN              -- Whether the day includes all-day wellness (watch-worn) data.
+    , includes_activity_data BOOLEAN              -- Whether the day includes recorded activities.
+    , source TEXT                                 -- Data source reported by Garmin (e.g., GARMIN).
+    , create_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was created in the database.
+    , update_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was last modified in the database.
+    , PRIMARY KEY (user_id, date)
+    , FOREIGN KEY (user_id) REFERENCES user (user_id)
+);
+
+CREATE INDEX IF NOT EXISTS daily_summary_user_id_date_idx
+ON daily_summary (user_id, date DESC);
+
+-- Nightly heart rate variability status (one row per user and calendar day): last-night average, weekly average, personal baseline range and Garmin status. The individual overnight readings go to the hrv table, linked to the matching sleep session.
+CREATE TABLE IF NOT EXISTS hrv_summary (
+    user_id BIGINT NOT NULL              -- References user(user_id). Identifies which user this HRV summary belongs to.
+    , date DATE NOT NULL                   -- Calendar date (calendarDate) of the morning the night ended.
+    , last_night_avg INTEGER               -- Average overnight HRV (RMSSD) in milliseconds.
+    , last_night_5min_high INTEGER         -- Highest 5-minute overnight HRV in milliseconds.
+    , weekly_avg INTEGER                   -- 7-day average overnight HRV in milliseconds.
+    , status TEXT                          -- HRV status (e.g., BALANCED, UNBALANCED, LOW, POOR, NONE).
+    , feedback_phrase TEXT                 -- Garmin feedback code (e.g., HRV_BALANCED_3).
+    , baseline_low_upper INTEGER           -- Upper bound of the low range of the personal baseline, in milliseconds.
+    , baseline_balanced_low INTEGER        -- Lower bound of the balanced baseline range, in milliseconds.
+    , baseline_balanced_upper INTEGER      -- Upper bound of the balanced baseline range, in milliseconds.
+    , baseline_marker_value FLOAT          -- Position of the weekly average within the baseline gauge (0-1).
+    , sleep_start_ts DATETIME              -- Start of the sleep the readings were taken during (UTC).
+    , sleep_end_ts DATETIME                -- End of that sleep (UTC).
+    , create_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was created in the database.
+    , update_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was last modified in the database.
+    , PRIMARY KEY (user_id, date)
+    , FOREIGN KEY (user_id) REFERENCES user (user_id)
+);
+
+CREATE INDEX IF NOT EXISTS hrv_summary_user_id_date_idx
+ON hrv_summary (user_id, date DESC);
+
+-- Body battery impact events (sleep, activities, naps, stress) as reported by Garmin, with the charge or drain each one caused. The level time series itself goes to the body_battery table.
+CREATE TABLE IF NOT EXISTS body_battery_event (
+    user_id BIGINT NOT NULL              -- References user(user_id). Identifies which user this event belongs to.
+    , start_ts DATETIME NOT NULL           -- Event start (UTC).
+    , event_type TEXT NOT NULL             -- Event type (e.g., SLEEP, ACTIVITY, NAP, RECOVERY, STRESS).
+    , duration_ms BIGINT                   -- Event duration in milliseconds.
+    , impact INTEGER                       -- Body battery change caused by the event (positive = charge, negative = drain).
+    , feedback_type TEXT                   -- Garmin feedback code for the event.
+    , short_feedback TEXT                  -- Short Garmin feedback code for the event.
+    , timezone_offset_ms BIGINT            -- Local time offset from UTC at the event, in milliseconds.
+    , create_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was created in the database.
+    , update_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was last modified in the database.
+    , PRIMARY KEY (user_id, start_ts, event_type)
+    , FOREIGN KEY (user_id) REFERENCES user (user_id)
+);
+
+-- Garmin fitness age estimates, sampled weekly (and on the last day of each sync) because they change slowly. Components are the inputs Garmin bases the estimate on.
+CREATE TABLE IF NOT EXISTS fitness_age (
+    user_id BIGINT NOT NULL              -- References user(user_id). Identifies which user this estimate belongs to.
+    , date DATE NOT NULL                   -- Calendar date the estimate was requested for.
+    , fitness_age FLOAT                    -- Estimated fitness age in years.
+    , chronological_age INTEGER            -- Actual age in years.
+    , previous_fitness_age FLOAT           -- Previous fitness age estimate in years.
+    , bmi FLOAT                            -- Body mass index used in the estimate.
+    , resting_heart_rate INTEGER           -- Resting heart rate (bpm) used in the estimate.
+    , vigorous_days_avg FLOAT              -- Average number of vigorous-activity days per week.
+    , vigorous_minutes_avg FLOAT           -- Average vigorous intensity minutes per week.
+    , last_updated DATETIME                -- When Garmin last recomputed the estimate.
+    , create_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was created in the database.
+    , update_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was last modified in the database.
+    , PRIMARY KEY (user_id, date)
+    , FOREIGN KEY (user_id) REFERENCES user (user_id)
+);
+
+-- Current heart rate zone configuration per sport (DEFAULT, RUNNING, CYCLING, ...). Refreshed on every sync; only the latest configuration is kept.
+CREATE TABLE IF NOT EXISTS heart_rate_zone (
+    user_id BIGINT NOT NULL              -- References user(user_id). Identifies which user these zones belong to.
+    , sport TEXT NOT NULL                  -- Sport the zones apply to (DEFAULT applies to all sports without their own zones).
+    , training_method TEXT                 -- Zone computation method (e.g., LACTATE_THRESHOLD, HR_RESERVE, MAX_HR).
+    , lactate_threshold_heart_rate INTEGER -- Lactate threshold heart rate used, in bpm.
+    , max_heart_rate INTEGER               -- Maximum heart rate used, in bpm.
+    , resting_heart_rate INTEGER           -- Resting heart rate used, in bpm.
+    , resting_hr_auto_update BOOLEAN       -- Whether the resting heart rate is updated automatically.
+    , zone1_floor INTEGER                  -- Lower bound of zone 1 in bpm.
+    , zone2_floor INTEGER                  -- Lower bound of zone 2 in bpm.
+    , zone3_floor INTEGER                  -- Lower bound of zone 3 in bpm.
+    , zone4_floor INTEGER                  -- Lower bound of zone 4 in bpm.
+    , zone5_floor INTEGER                  -- Lower bound of zone 5 in bpm.
+    , create_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was created in the database.
+    , update_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was last modified in the database.
+    , PRIMARY KEY (user_id, sport)
+    , FOREIGN KEY (user_id) REFERENCES user (user_id)
+);
+
+-- Structured workouts followed during an activity (planned steps with durations and targets), for comparing what was planned with what was done.
+CREATE TABLE IF NOT EXISTS activity_workout (
+    activity_id BIGINT NOT NULL          -- References activity(activity_id). Identifies which activity followed this workout.
+    , workout_index INTEGER NOT NULL       -- Position of the workout within the activity (0 for the first).
+    , workout_name TEXT                    -- Workout name.
+    , sport TEXT                           -- Workout sport (e.g., RUNNING, CYCLING).
+    , manufacturer TEXT                    -- Workout author or source (e.g., GARMIN).
+    , step_count INTEGER NOT NULL          -- Number of steps in steps_json.
+    , steps_json JSON NOT NULL             -- Workout steps as a JSON array, as returned by Garmin: intensity (WARMUP, INTERVAL, RECOVERY, ...), durationType and durationValue, targetType with targetValueLow/High, exercise fields for strength steps.
+    , time_created TEXT                    -- When the workout was created, as reported by Garmin.
+    , create_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was created in the database.
+    , update_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was last modified in the database.
+    , PRIMARY KEY (activity_id, workout_index)
+    , FOREIGN KEY (activity_id) REFERENCES activity (activity_id) ON DELETE CASCADE
+    , CONSTRAINT activity_workout_steps_json_valid CHECK (JSON_VALID(steps_json))
+    , CONSTRAINT activity_workout_steps_json_is_array CHECK (
+        JSON_TYPE(steps_json) = 'array'
+    )
+);
+
+-- Logged food and meals per day, stored as returned by Garmin (only days with at least one logged food or meal).
+CREATE TABLE IF NOT EXISTS nutrition_log (
+    user_id BIGINT NOT NULL              -- References user(user_id). Identifies which user this log belongs to.
+    , date DATE NOT NULL                   -- Meal date (mealDate).
+    , food_count INTEGER NOT NULL          -- Number of entries in loggedFoodsWithServingSizes.
+    , meal_count INTEGER NOT NULL          -- Number of entries in mealDetails.
+    , log_json JSON NOT NULL               -- Full food-log response for the day as JSON.
+    , create_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was created in the database.
+    , update_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was last modified in the database.
+    , PRIMARY KEY (user_id, date)
+    , FOREIGN KEY (user_id) REFERENCES user (user_id)
+    , CONSTRAINT nutrition_log_log_json_valid CHECK (JSON_VALID(log_json))
+);

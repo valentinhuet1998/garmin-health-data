@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Garmin Personal API key authentication**. `garmin auth` now validates and stores an official [Personal API key](https://developer.garmin.com/gc-developer-program/personal/personal-api/) (from `--api-key`, `GARMIN_PERSONAL_API_KEY`, a `./.env` file, or a hidden prompt) in `~/.garminconnect/<user_id>/personal_api_key`; the email/password login moves behind `garmin auth --sso`. The key is exchanged for a 24-hour JWT bearer token kept in memory only. A new `HybridClient` (`garmin_client/hybrid.py`) routes each data type to the Personal API when it serves it (`PersonalApiClient.SUPPORTED_METHODS`) and to the SSO tokens otherwise, so both methods can coexist per account; with a key alone, SSO-only data types are skipped with a notice instead of being counted as failures. HTTP 429 responses are retried after the delay Garmin indicates.
+- **Seven Personal-API-only data types (total tables 42 → 49)**: `DAILY_SUMMARY` (`daily_summary`), `HRV` (`hrv_summary`, with overnight readings linked to the sleep session in `hrv`), `BODY_BATTERY` (levels in `body_battery`, impacts in `body_battery_event`), `FITNESS_AGE` (`fitness_age`), `HR_ZONES` (`heart_rate_zone`), `ACTIVITY_WORKOUT` (`activity_workout`) and `NUTRITION` (`nutrition_log`).
+- **`garmin sync` command** to keep a database current: runs the `extract` pipeline for every data type the configured credentials can reach, through today inclusive, starting `--overlap-days` (default 2) before the last stored date; `--full` backfills from the oldest recorded activity.
+
 ### Fixed
 
 - `garmin verify` now exits with code 1 when SQLite reports an integrity failure and prints every returned diagnostic. Previously it printed only the first error and exited with code 0, so scripts could treat a failed check as successful.

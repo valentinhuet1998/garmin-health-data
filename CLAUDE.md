@@ -134,6 +134,20 @@ When working with authentication code:
 - Use environment variables or secure credential storage.
 - Follow existing patterns in `garmin_health_data/auth.py`.
 - Respect token expiration and refresh logic.
+- Two auth methods coexist per account: the Personal API key (default,
+  `garmin_client/personal.py`) and email/password SSO tokens (`garmin_client/client.py`).
+  `garmin_client/hybrid.py` routes each API method to the Personal API when it is in
+  `PersonalApiClient.SUPPORTED_METHODS`, else to SSO. The Personal API gateway
+  returns 404 for any path outside its documented subset, so verify a new endpoint
+  against it before adding it to `SUPPORTED_METHODS`.
+- Personal-API-only data types (`DAILY_SUMMARY`, `HRV`, `BODY_BATTERY`, `FITNESS_AGE`,
+  `HR_ZONES`, `ACTIVITY_WORKOUT`, `NUTRITION`) have their methods on
+  `PersonalApiClient` only; `garmin sync` (in `cli.py`) is the entry point that keeps
+  a database current with all of them. Data type names are matched as filename
+  regex prefixes in registry order, so a new name must not contain an existing one
+  (hence `HR_ZONES`, not `HEART_RATE_ZONES`).
+- Tests must never read a real key: `tests/conftest.py` unsets
+  `GARMIN_PERSONAL_API_KEY` and redirects the `.env` lookup for every test.
 
 ## Data Processing Patterns
 

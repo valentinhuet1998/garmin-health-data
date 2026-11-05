@@ -17,7 +17,9 @@ https://github.com/user-attachments/assets/65023665-fa7a-4bbf-85d6-c3d4a3145171
 - 👥 **Multi-account**: one database across multiple Garmin Connect accounts (e.g. family members). Run `garmin auth` once per account; extraction discovers and processes them automatically.
 - 🛡️ **Resilient pipeline**: four-folder lifecycle (`ingest/process/storage/quarantine`), auto-resume from the last update, crash recovery, and per-date / per-data-type / per-activity / per-FileSet failure isolation. Original files are preserved on disk for offline backup and post-mortem inspection.
 - 🗜️ **Bounded disk usage**: `garmin downsample` aggregates per-second sensor data into time-bucketed records, and `garmin prune` deletes the source rows. Together they let you run a multi-year history without unbounded growth (`activity_ts_metric` is ~93% of typical DB size).
-- 🔐 **Self-contained Garmin client**: bundled SSO/MFA login client, with no third-party Garmin Connect client library dependency.
+- 🔄 **One-command sync for AI coaching**: `garmin sync` pulls everything your credentials can reach, through today: activities and FIT files, structured workouts, sleep, nightly HRV status, daily summaries (steps, stress, body battery, SpO2, respiration, intensity minutes), the body battery curve and events, fitness age, heart rate zones, weigh-ins and nutrition. `--full` backfills your whole history once.
+- 🔑 **Garmin Personal API key**: authenticate with an official [Personal API key](https://developer.garmin.com/gc-developer-program/personal/personal-api/) instead of your password, with optional email/password login for the data types the Personal API does not serve.
+- 🔐 **Self-contained Garmin client**: bundled Personal API and SSO/MFA login clients, with no third-party Garmin Connect client library dependency.
 - 🖥️ **Cross-platform**: macOS, Linux, Windows. Python 3.10+.
 
 ## Requirements
@@ -45,24 +47,34 @@ pip install garmin-health-data
 
 ### First-Time Setup
 
+1. Create a Personal API key in Garmin Connect: [Settings → Personal API Key](https://connect.garmin.com/app/settings/personalApiToken) → **Create Key** (pick an expiration from 30 days to one year). The key is shown only once; treat it like a password.
+2. Give it to the tool, either way:
+
 ```bash
-# Authenticate with Garmin Connect (one-time setup)
+# Option A: save it once (prompted with hidden input).
 garmin auth
+
+# Option B: no setup command, just set it in the environment or in a .env file
+# in the directory you run garmin from (keep .env out of version control).
+echo "GARMIN_PERSONAL_API_KEY=your-key" > .env
 ```
 
-You'll be prompted for your Garmin Connect email and password. Your credentials are used only to obtain OAuth tokens. After login, your Garmin user ID is auto-detected and tokens are stored in `~/.garminconnect/<user_id>/`.
+`garmin auth` validates the key, auto-detects your Garmin user ID, and stores the key in `~/.garminconnect/<user_id>/personal_api_key`. See [Personal API key vs. email/password](#personal-api-key-vs-emailpassword) for the data types that also need `garmin auth --sso`.
 
-### Extract Your Data
+### Sync Your Data
 
 ```bash
-# Extract all available data
-garmin extract
+# First time: fetch your whole history (from your oldest recorded activity)
+garmin sync --full
+
+# Then, regularly (e.g. every morning): fetch what is new, today included
+garmin sync
 
 # View database statistics
 garmin info
 ```
 
-That's it! `garmin extract` saved your raw downloaded files under `garmin_files/storage/` (kept on disk as an offline backup) and loaded them into a local SQLite database (`garmin_data.db`) for analysis.
+That's it! `garmin sync` saved your raw downloaded files under `garmin_files/storage/` (kept on disk as an offline backup) and loaded them into a local SQLite database (`garmin_data.db`) for analysis.
 
 ## Upgrading from 2.8.x or earlier
 
@@ -105,38 +117,57 @@ Both paths are idempotent: the `sleep` summary upsert will reuse existing rows, 
 ### Authentication & multi-account
 
 ```bash
-# Interactive authentication (one-time setup, run once per account)
-garmin auth
+# Personal API key (default, one-time setup per account)
+garmin auth                       # prompts for the key (hidden input)
+garmin auth --api-key 'your-key'  # non-interactive (exposed to shell history)
 
-# If you have MFA enabled, you'll be prompted for your code
+# Email/password login, for the data types the Personal API does not serve
+garmin auth --sso                 # prompts for email, password, and MFA code
 ```
 
-`garmin auth` performs a fresh login and stores OAuth tokens locally. Tokens auto-refresh transparently as long as you extract at least once every 30 days, so you typically only run `garmin auth` once per account or after a long pause. `garmin extract` checks for existing tokens and only prompts for authentication if they're missing.
+The key is read, in order, from `--api-key`, the `GARMIN_PERSONAL_API_KEY` environment variable, or a `.env` file in the current directory; otherwise you are prompted. A key set in the environment or `.env` is also picked up directly by `garmin extract`, without running `garmin auth`. `garmin extract` only prompts for authentication if no key or tokens are found.
+
+#### Personal API key vs. email/password
+
+The Personal API serves only part of the Garmin Connect endpoints. Both methods can be configured for the same account: each data type then goes through the API key when the Personal API serves it, and through the email/password tokens otherwise.
+
+| With a Personal API key | Also needs `garmin auth --sso` |
+| --- | --- |
+| `ACTIVITY` (FIT/TCX files), `ACTIVITIES_LIST`, `MULTISPORT_CHILDREN`, `HEART_RATE`, `BODY_COMPOSITION`, `MENSTRUAL_CYCLE_DAY`, `SLEEP` (nightly summary and scores), plus the Personal-API-only types `DAILY_SUMMARY`, `HRV` (status and overnight readings, filling the `hrv` sleep table), `BODY_BATTERY` (3-minute levels and events), `FITNESS_AGE`, `HR_ZONES`, `ACTIVITY_WORKOUT`, `NUTRITION` | `STRESS`, `RESPIRATION`, `TRAINING_READINESS`, `TRAINING_STATUS`, `STEPS`, `FLOORS`, `INTENSITY_MINUTES`, `RUNNING_TOLERANCE`, `MENSTRUAL_CYCLE_SUMMARY`, `PERSONAL_RECORDS`, `RACE_PREDICTIONS`, `USER_PROFILE`, `EXERCISE_SETS`, and the per-minute `SLEEP` detail tables (`sleep_level`, `sleep_movement`, `spo2`, `breathing_disruption`, ...) |
+
+Many of the right-hand metrics still have a daily equivalent with the key alone: `daily_summary` carries the stress breakdown, steps, floors, intensity minutes and respiration aggregates of each day. With email/password tokens alone, the Personal-API-only types are skipped. With an API key alone, `garmin extract` skips the right-hand types with a one-line notice (not counted as failures). Activities from the Personal API lack the informational `hasPolyline`, `hasHeatMap`, and `purposeful` flags, which are stored as `0`. The Personal API allows about 100 requests per minute; when the limit is hit, the client waits the delay Garmin indicates and retries, so long backfills are slower than with email/password.
 
 For multiple accounts (e.g. family members), authenticate each in turn — they all extract into the same database:
 
 ```bash
-garmin auth --email user1@example.com --password pass1
-garmin auth --email user2@example.com --password pass2
+garmin auth --api-key 'key-of-user-1'
+garmin auth --api-key 'key-of-user-2'
 ```
 
-Tokens are stored in per-account subdirectories and discovered automatically:
+Credentials are stored in per-account subdirectories and discovered automatically:
 
 ```text
 ~/.garminconnect/
-├── 12345678/              # Account 1 tokens
-│   └── garmin_tokens.json
-└── 87654321/              # Account 2 tokens
-    └── garmin_tokens.json
+├── 12345678/              # Account 1
+│   ├── personal_api_key   # garmin auth
+│   └── garmin_tokens.json # garmin auth --sso (optional)
+└── 87654321/              # Account 2
+    └── personal_api_key
 ```
 
-All discovered accounts are extracted sequentially when running `garmin extract`, with per-account error isolation (one failing account doesn't block others).
+All discovered accounts are extracted sequentially when running `garmin extract`, with per-account error isolation (one failing account doesn't block others). If one method fails for an account (e.g. an expired key), extraction continues with the other method when it is configured.
+
+Personal API keys expire after the period chosen when creating them (Garmin emails a reminder about a week before). Create a new key and run `garmin auth` again to replace it.
+
+#### Email/password login (`--sso`)
+
+`garmin auth --sso` performs a fresh login and stores OAuth tokens locally. Tokens auto-refresh transparently as long as you extract at least once every 30 days, so you typically only run it once per account or after a long pause. If you have MFA enabled, you'll be prompted for your code. `garmin auth --email user@example.com --password '...'` (or the `GARMIN_EMAIL` / `GARMIN_PASSWORD` environment variables) also selects this method.
 
 > Login strategies, token rotation, and the 30-45s anti-rate-limit pause: see [Reference](#reference).
 
 #### Manual login (Cloudflare fallback)
 
-Garmin guards its login endpoints with Cloudflare, which can block the automated `garmin auth` entirely (repeated `403` / `429` errors, ending in "Authentication failed"). When that happens, log in with a ticket captured from your own browser, which passes Cloudflare because it is a real, human session. In an interactive terminal a normal `garmin auth` offers this fallback automatically after the automated login fails; you can also invoke it directly:
+This section only concerns the email/password login; the Personal API key is not affected. Garmin guards its login endpoints with Cloudflare, which can block the automated `garmin auth --sso` entirely (repeated `403` / `429` errors, ending in "Authentication failed"). When that happens, log in with a ticket captured from your own browser, which passes Cloudflare because it is a real, human session. In an interactive terminal a normal `garmin auth --sso` offers this fallback automatically after the automated login fails; you can also invoke it directly:
 
 ```bash
 garmin auth --manual
@@ -153,6 +184,27 @@ The tool exchanges that ticket for OAuth tokens and saves them exactly like a no
 
 ```bash
 garmin auth --ticket 'ST-....-cas'
+```
+
+### Syncing everything (`garmin sync`)
+
+`garmin sync` is the recommended command to keep a database current, e.g. as the data source of an AI coaching agent. It runs the same pipeline as `garmin extract` for every data type your credentials can reach, with a window suited to keeping up to date:
+
+- **Ends today, inclusive**: last night's sleep, HRV status and this morning's body battery are included (`garmin extract` stops at yesterday by default).
+- **Incremental by default**: starts `--overlap-days` (default 2) before the last stored date, so a day synced while it was still in progress gets completed on the next run. Every write is an idempotent upsert, so the overlap never duplicates rows.
+- **`--full`**: starts at your oldest recorded activity (found with the Personal API key), or at `--start-date` if given. Run it once; it is slow on a long history because of the Personal API rate limit (about 100 requests per minute, roughly 5 requests per day of history plus 2 per activity, i.e. about 20 minutes for 8 months).
+
+```bash
+garmin sync --full                         # whole history, once
+garmin sync                                # daily
+garmin sync --start-date 2026-01-01        # explicit start
+garmin sync --exclude-data-types NUTRITION # skip a data type
+```
+
+A daily cron entry is enough to keep the database current:
+
+```bash
+0 7 * * * cd /path/with/.env && garmin sync --db-path ~/garmin_data.db
 ```
 
 ### Extracting data
@@ -287,7 +339,8 @@ The data lives in a single SQLite file (default `./garmin_data.db`). Query it wi
 
 | Command | What it does | Section |
 |---|---|---|
-| [`garmin auth`](#garmin-auth) | Log into Garmin Connect and store OAuth tokens. Run once per account; falls back to a manual browser-ticket login when Cloudflare blocks the automated login. | [auth](#garmin-auth) |
+| [`garmin auth`](#garmin-auth) | Validate and store a Garmin Personal API key (default), or log in with email/password (`--sso`) and store OAuth tokens. Run once per account. | [auth](#garmin-auth) |
+| [`garmin sync`](#garmin-sync) | Fetch every data type your credentials can reach, through today, incrementally (or the whole history with `--full`). The recommended way to keep a database current. | [sync](#garmin-sync) |
 | [`garmin extract`](#garmin-extract) | Download data from Garmin Connect and load it into the SQLite database. The default workflow. Supports rolling-window auto retention via opt-in flags. | [extract](#garmin-extract) |
 | [`garmin info`](#garmin-info) | Show row counts, last-update dates, and DB size. Read-only. | [info](#garmin-info) |
 | [`garmin verify`](#garmin-verify) | Check schema integrity and run SQLite's `PRAGMA integrity_check`. Read-only. | [verify](#garmin-verify) |
@@ -302,10 +355,32 @@ All commands accept `--db-path PATH` (defaults to `./garmin_data.db`). Run any c
 
 ```bash
 garmin auth
+garmin auth --api-key 'your-key'
+garmin auth --sso
 garmin auth --email user@example.com --password '...'
 ```
 
-Performs a fresh interactive login and stores OAuth tokens in `~/.garminconnect/<user_id>/`. Run once per Garmin Connect account; tokens auto-refresh as long as you extract at least once every 30 days. The `--email` / `--password` flags can also be supplied via the `GARMIN_EMAIL` / `GARMIN_PASSWORD` environment variables. If Garmin's Cloudflare protection blocks the automated login, `--manual` runs a browser-ticket fallback that prints step-by-step capture instructions, and `--ticket 'ST-...'` (a raw service ticket or the full redirect URL that carries it) performs the exchange non-interactively; see [Manual login (Cloudflare fallback)](#manual-login-cloudflare-fallback). See the [Authentication internals](#authentication-internals) collapsible below for the login-strategy waterfall and the 30-45s anti-rate-limit pause explanation.
+| Flag | Purpose |
+| --- | --- |
+| `--api-key KEY` | Personal API key to validate and save in `~/.garminconnect/<user_id>/personal_api_key` (the default method). Falls back to `GARMIN_PERSONAL_API_KEY` / `./.env`, then a hidden prompt. |
+| `--sso` | Log in with email/password instead and store OAuth tokens in `~/.garminconnect/<user_id>/garmin_tokens.json`; tokens auto-refresh as long as you extract at least once every 30 days. |
+| `--email` / `--password` | Credentials for the email/password login (also `GARMIN_EMAIL` / `GARMIN_PASSWORD`); providing both implies `--sso`. |
+| `--manual` / `--ticket 'ST-...'` | Email/password login through a browser-captured ticket when Cloudflare blocks the automated login; see [Manual login (Cloudflare fallback)](#manual-login-cloudflare-fallback). |
+
+Run once per Garmin Connect account and method. See the [Authentication internals](#authentication-internals) collapsible below for the API-key token exchange, the email/password login-strategy waterfall, and the 30-45s anti-rate-limit pause explanation.
+
+### `garmin sync`
+
+| Flag | Type | Purpose |
+| --- | --- | --- |
+| `--full` | Flag | Start at the oldest recorded activity (looked up with the Personal API key). |
+| `--start-date YYYY-MM-DD` | Inclusive | Explicit start; overrides `--full` and the automatic start. |
+| `--overlap-days N` | 0-30, default 2 | On incremental runs, re-fetch N days before the last stored date. |
+| `--exclude-data-types NAME` | Repeatable | Leave data types out. |
+| `--accounts ID` | Repeatable or comma-separated | Restrict to specific Garmin user IDs. |
+| `--db-path PATH` | File path | Defaults to `./garmin_data.db`. |
+
+Without `--full` or `--start-date`, an empty database syncs the last 30 days. The window always ends today (inclusive). Everything else (file lifecycle, retries, per-account isolation, end-of-run failure summary) is shared with `garmin extract`.
 
 ### `garmin extract`
 
@@ -387,7 +462,9 @@ Using the maximum (rather than per-table latest) means each automatic run covers
 <details>
 <summary><strong>Authentication internals</strong></summary>
 
-`garmin auth` uses a self-contained SSO client (`garmin_health_data/garmin_client/`) that tries five login strategies in order until one succeeds:
+**Personal API key.** On each run the key is exchanged at `https://personal.connectapi.garmin.com/personalapitoken-service/personal-api/personal-api-key/token` (header `Authorization: ApiKey <key>`) for a 24-hour JWT bearer token, kept in memory only and renewed shortly before it expires or on HTTP 401; there is no refresh token. The Garmin user ID is read from `userProfilePK` on the heart-rate endpoint, since the Personal API profile endpoint omits it. Data requests go to the same Connect service paths on `personal.connectapi.garmin.com`; paths outside the documented [Personal API surface](https://developer.garmin.com/gc-developer-program/personal/swagger-docs/) return 404, which is why `HybridClient` (`garmin_client/hybrid.py`) routes those data types to the email/password tokens.
+
+**Email/password.** `garmin auth --sso` uses a self-contained SSO client (`garmin_health_data/garmin_client/`) that tries five login strategies in order until one succeeds:
 
 1. Portal web login via `curl_cffi` (TLS browser fingerprint impersonation, 30-45s pre-submit delay).
 2. Portal web login via `requests` (30-45s pre-submit delay).
@@ -395,15 +472,15 @@ Using the maximum (rather than per-table latest) means each automatic run covers
 4. Mobile login via `requests` (30-45s pre-submit delay).
 5. Widget login via `curl_cffi` (last resort — 429s reliably under current Cloudflare config, kept for future use).
 
-**If you see a 30-45 second pause during `garmin auth`, this is normal.** The delay is a deliberate Cloudflare WAF countermeasure — submitting credentials too quickly triggers a 429 rate limit. Tokens obtained are DI OAuth2 Bearer tokens; no session cookies or password are stored after the initial login.
+**If you see a 30-45 second pause during `garmin auth --sso`, this is normal.** The delay is a deliberate Cloudflare WAF countermeasure — submitting credentials too quickly triggers a 429 rate limit. Tokens obtained are DI OAuth2 Bearer tokens; no session cookies or password are stored after the initial login.
 
-If all five strategies are exhausted without success (uncommon — typically only during Garmin-side outages), `garmin auth` exits with an error. Wait a few minutes and retry.
+If all five strategies are exhausted without success (uncommon — typically only during Garmin-side outages), `garmin auth --sso` exits with an error. Wait a few minutes and retry.
 
-**Token lifecycle:**
+**SSO token lifecycle:**
 
 - Access tokens (~18h) auto-refresh transparently using the refresh token (30 days, rotates on each use). As long as you extract at least once within 30 days, tokens stay valid indefinitely.
-- `garmin auth` always performs a fresh login and refreshes tokens, even if valid ones already exist.
-- `garmin extract` checks for existing tokens and only prompts for authentication if they're missing.
+- `garmin auth --sso` always performs a fresh login and refreshes tokens, even if valid ones already exist.
+- `garmin extract` checks for an API key or existing tokens and only prompts for authentication if both are missing.
 - After login, your Garmin user ID is auto-detected and tokens are stored in `~/.garminconnect/<user_id>/`.
 
 </details>
@@ -561,11 +638,18 @@ The command is **idempotent** (a database that already has `parent_activity_id` 
 | **PERSONAL_RECORDS** | All-time bests across sports | As achieved |
 | **RACE_PREDICTIONS** | Predicted race times | Periodic updates |
 | **USER_PROFILE** | Demographics, fitness metrics | Periodic updates |
+| **DAILY_SUMMARY** | Personal API. Steps, distance, floors, calories, active/sedentary time, intensity minutes, resting/min/max HR, stress breakdown, body battery (at wake, high, low, charged, drained, feedback), SpO2, respiration | Daily |
+| **HRV** | Personal API. Nightly HRV status (last-night and weekly averages, baseline range, status) and overnight readings linked to the sleep session | Daily (readings ~5-min) |
+| **BODY_BATTERY** | Personal API. Body battery level and impact events (sleep, activities, naps) | 3-min intervals |
+| **FITNESS_AGE** | Personal API. Fitness age and its components (BMI, resting HR, vigorous activity) | Weekly sample |
+| **HR_ZONES** | Personal API. Current heart rate zones per sport and the thresholds they use | Current snapshot |
+| **ACTIVITY_WORKOUT** | Personal API. Structured workout followed during an activity: planned steps with durations and targets | Per activity |
+| **NUTRITION** | Personal API. Logged foods and meals (raw JSON) | Per day with entries |
 | **ACTIVITY** | FIT (binary) or TCX (XML) activity files with detailed time-series sensor data (plus laps, splits, pool-swim lengths, events, HRV, and session metrics from FIT) | Per activity |
 
 ### Database Schema
 
-The SQLite database contains 42 tables organized by category. The complete schema is defined in [garmin_health_data/tables.ddl](garmin_health_data/tables.ddl) following the same pattern as the [openetl project](https://github.com/diegoscarabelli/openetl). The schema includes inline documentation comments for all tables and columns, which are preserved in the SQLite database itself:
+The SQLite database contains 49 tables organized by category. The complete schema is defined in [garmin_health_data/tables.ddl](garmin_health_data/tables.ddl) following the same pattern as the [openetl project](https://github.com/diegoscarabelli/openetl). The schema includes inline documentation comments for all tables and columns, which are preserved in the SQLite database itself:
 
 ```bash
 # View schema for a specific table
@@ -701,18 +785,32 @@ menstrual_cycle_summary (per-cycle summaries: start date, period length, predict
 
 *Foreign keys: `menstrual_cycle_day` → `user.user_id`; `menstrual_cycle_tag` → `menstrual_cycle_day(user_id, date)` ON DELETE CASCADE; `menstrual_cycle_summary` → `user.user_id`. Per-cycle summaries from Garmin's calendar endpoint include both user-logged cycles and Garmin's projections of upcoming cycles (predicted_cycle column). Predicted rows are wiped and re-inserted on every extract because Garmin recomputes projections as new data is logged; observed rows are upserted by `(user_id, start_date)`.*
 
+**Personal API (7 tables)**
+
+```
+daily_summary (one row per day: steps, stress breakdown, body battery, SpO2, respiration, ...)
+hrv_summary (nightly HRV status, averages, baseline range)
+body_battery_event (sleep / activity / nap impacts on body battery)
+fitness_age (weekly fitness age estimates and components)
+heart_rate_zone (current zones per sport)
+activity_workout (structured workout steps followed during an activity)
+nutrition_log (logged foods and meals per day, raw JSON)
+```
+
+*Foreign keys: all tables → `user.user_id`, except `activity_workout` → `activity.activity_id` ON DELETE CASCADE. The overnight HRV readings go to the existing `hrv` table (linked to the matching `sleep` row, whose `avg_overnight_hrv` / `hrv_status` are filled too), and the body battery levels to the existing `body_battery` table.*
+
 </details>
 
 ## Privacy & Security
 
-- **Your credentials never leave your machine**: they're only used to obtain OAuth tokens, stored locally in `~/.garminconnect/<user_id>/`. On Unix-like systems, token directories and files are locked to owner-only access (0o700 directories, 0o600 files); on Windows, standard user-profile permissions apply.
+- **Your credentials never leave your machine**: the Personal API key is only sent to Garmin's token endpoint, and your email/password (if you use `--sso`) only to obtain OAuth tokens. Keys and tokens are stored locally in `~/.garminconnect/<user_id>/`. On Unix-like systems, these directories and files are locked to owner-only access (0o700 directories, 0o600 files); on Windows, standard user-profile permissions apply. If you keep the key in a `.env` file, make sure it is git-ignored (this repository's `.gitignore` does).
 - **All data stays on your machine**: no cloud services involved.
 - **No analytics or tracking**: this tool doesn't send any data anywhere except querying the Garmin Connect API directly.
 - **Sensitive cycle-tracking fields**: when `MENSTRUAL_CYCLE_DAY` is extracted, the per-day log includes the user's freeform `notes`, `sexual_activity`, and `sex_drive` fields alongside the cycle-state scalars. These are captured for completeness so the local database is a faithful mirror of what Garmin Connect stores. They never leave the machine, but they are more sensitive than HR or steps; reviewers of the `garmin_data.db` file should know they're there.
 
 ## Comparison With Other Tools
 
-**[garmin-health-data](https://github.com/diegoscarabelli/garmin-health-data)** is designed for comprehensive data extraction with a well-structured relational schema that supports both human-powered analytics and LLM-powered analysis via agents querying the locally created SQLite file. It extracts complete FIT file data with per-second activity metrics, 1-minute sleep intervals, and sport-specific tables for detailed analysis. The normalized 42-table schema with explicit SQL constraints ensures data integrity and makes it easy to understand relationships for complex queries, power zone analysis, running dynamics, and long-term trend studies.
+**[garmin-health-data](https://github.com/diegoscarabelli/garmin-health-data)** is designed for comprehensive data extraction with a well-structured relational schema that supports both human-powered analytics and LLM-powered analysis via agents querying the locally created SQLite file. It extracts complete FIT file data with per-second activity metrics, 1-minute sleep intervals, and sport-specific tables for detailed analysis. The normalized 49-table schema with explicit SQL constraints ensures data integrity and makes it easy to understand relationships for complex queries, power zone analysis, running dynamics, and long-term trend studies.
 
 **[garmy](https://github.com/bes-dev/garmy)** is optimized for programmatic access to the Garmin Connect API, particularly useful for AI assistant integration via its built-in MCP (Model Context Protocol) server. It enables real-time interaction with Claude Desktop or custom chatbots for quick daily insights and summaries. However, it's limited to API-provided metrics (daily aggregates only, no FIT file access), making deep analytics or granular time-series analysis impossible. Best suited for lightweight health monitoring apps that prioritize AI integration over comprehensive data collection.
 
@@ -739,7 +837,7 @@ split below; garmin-health-data anchors both for reference.
 | **Sleep data granularity** | ✅ 7 tables, 1-min intervals | ⚠️ 2 tables, less granular | ⚠️ 1 table, daily aggregate | ⚠️ Stage durations only, no per-minute table | ⚠️ Daily/summary only |
 | **FIT file time-series data** | ✅ All metrics (EAV schema) | ⚠️ Limited (~10 core fields) | ❌ API-only (no FIT files) | ⚠️ Fixed-column trackpoints, no running/cycling dynamics | ❌ Summary only, no GPS/sample streams |
 | **Power meter & advanced metrics** | ✅ Full support | ❌ Not captured | ❌ API limitations | ⚠️ Basic power value only | ❌ Not captured |
-| **Database schema quality** | ✅ Normalized, 42 tables | ⚠️ ~31 tables, mixed normalization | ❌ Very simple | ⚠️ 50 tables, fixed columns | ⚠️ Simple, rebuildable from raw JSON |
+| **Database schema quality** | ✅ Normalized, 49 tables | ⚠️ ~31 tables, mixed normalization | ❌ Very simple | ⚠️ 50 tables, fixed columns | ⚠️ Simple, rebuildable from raw JSON |
 | **Duplicate prevention** | ✅ Explicit SQL ON CONFLICT | ⚠️ ORM merge (undocumented) | ✅ ORM merge + sync tracking | ✅ Explicit upserts | ✅ Idempotent sync |
 | **Auto-resume** | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Active maintenance** | ✅ | ✅ | ✅ | ✅ | ✅ |
